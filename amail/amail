@@ -1,0 +1,609 @@
+#!/usr/bin/env python3
+"""amail: mail between independent agent instances, stored as markdown files.
+
+Root: /proj/<project>/amail on CloudLab hosts (shared NFS across the experiment), otherwise
+~/amail, which exists only once a user has run `amail init`.
+
+Layout under the root:
+  amail, amail-tui          shared copies of the scripts
+  agents/<name>.md          registration (frontmatter)
+  mail/<id>.md              every message, canonical copy (read-only)
+  ledger/<id>.sha256        checksum of each message, for `amail verify`
+  inbox/<name>/new/<id>.md  unread (hardlink to mail/<id>.md)
+  inbox/<name>/cur/<id>.md  read
+  inbox/<name>/watch.sh     poll-based watcher (inotify misses writes from other NFS clients)
+  DOWN                      present while a user has disabled sending (`amail down`)
+  inbox/<name>/heartbeat    mtime = last time the agent checked mail (watcher, inbox, read)
+
+Nothing under mail/, ledger/ or inbox/ is ever deleted: messages are write-once, reading
+only moves new/ -> cur/, and `verify` only restores.
+
+AMAIL_ROOT overrides the root; AMAIL_FQDN overrides the hostname (testing only).
+"""
+import argparse
+import getpass
+import hashlib
+import os
+import re
+import secrets
+import shutil
+import socket
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+VERSION = 5  # bump when changing either script; newer versions replace the shared copies
+NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+BROADCAST = "all"
+MSG_FIELDS = ["id", "date", "from", "to", "model", "project", "user", "host", "re", "thread",
+              "delivered"]
+AGENT_FIELDS = ["name", "model", "project", "user", "host", "registered", "status",
+                "supersedes", "superseded_by"]
+
+DOWN_MSG = ("amail is temporarily down. Any tasks requiring coordination with other agents should "
+            "be checkpointed, and resumed later when amail is restored. Continue working on "
+            "independent tasks. If there is a critical situation, inform the user")
+UP_MSG = "amail is restored. Resume any checkpointed tasks that need other agents."
+EX_TEMPFAIL = 75
+
+WATCH_SH = """#!/bin/sh
+# amail watcher for {name}. Polls; prints one line per new message.
+# Usage: watch.sh [--once] [interval_seconds]
+#   --once  exit after the first poll that finds unread mail, or when amail goes down/up
+dir='{new}'
+hb='{hb}'
+down='{down}'
+once=0
+[ "$1" = --once ] && {{ once=1; shift; }}
+iv=${{1:-15}}
+state() {{ if [ -e "$down" ]; then echo down; else echo up; fi; }}
+was=$(state)
+[ "$was" = down ] && echo "amail: {down_msg}"
+prev=' '
+while :; do
+  touch "$hb"
+  is=$(state)
+  if [ "$is" != "$was" ]; then
+    if [ "$is" = down ]; then echo "amail: {down_msg}"; else echo "amail: {up_msg}"; fi
+    was=$is
+    [ $once = 1 ] && exit 0
+  fi
+  now=' '
+  found=0
+  for f in "$dir"/*.md; do
+    [ -e "$f" ] || continue
+    id=$(basename "$f" .md)
+    now="$now$id "
+    case "$prev" in *" $id "*) continue ;; esac
+    from=$(grep -m1 '^from: ' "$f" | cut -d' ' -f2-)
+    echo "amail: new message $id from $from -> run: {cmd} read {name}"
+    found=1
+  done
+  prev=$now
+  [ $once = 1 ] && [ $found = 1 ] && exit 0
+  sleep "$iv"
+done
+"""
+
+
+def die(msg):
+    print(f"amail: {msg}", file=sys.stderr)
+    sys.exit(1)
+
+
+def hostname():
+    """(hostname, on_cloudlab)"""
+    names = [os.environ.get("AMAIL_FQDN", ""), socket.gethostname(), socket.getfqdn()]
+    for n in names:
+        if n.lower().endswith(".cloudlab.us"):
+            return n, True
+    return names[0] or socket.gethostname(), False
+
+
+def find_root(host, cloudlab):
+    if os.environ.get("AMAIL_ROOT"):
+        return Path(os.environ["AMAIL_ROOT"])
+    if not cloudlab:
+        return Path.home() / "amail"
+    here = Path(__file__).resolve().parent
+    if here.name == "amail" and here.parent.parent == Path("/proj"):
+        return here
+    try:
+        projs = [p for p in Path("/proj").iterdir() if p.is_dir()]
+    except OSError:
+        projs = []
+    parts = host.split(".")  # node.experiment.project.cluster.cloudlab.us
+    if len(parts) > 2:
+        want = parts[2].lower()
+        for p in projs:
+            if p.name.lower() == want:
+                return p / "amail"
+        if Path("/proj", parts[2]).is_dir():  # automounted, not listed yet
+            return Path("/proj", parts[2], "amail")
+    if len(projs) == 1:
+        return projs[0] / "amail"
+    die("can't find /proj/<project>; set AMAIL_ROOT=/proj/<project>/amail")
+
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+def check_name(name):
+    if not NAME_RE.match(name) or name == BROADCAST:
+        die(f"invalid name {name!r} (letters, digits, . _ -; not {BROADCAST!r})")
+
+
+def render(meta, fields, body=""):
+    head = "".join(f"{k}: {' '.join(str(meta[k]).split())}\n" for k in fields if meta.get(k))
+    return f"---\n{head}---\n\n{body.rstrip()}\n" if body else f"---\n{head}---\n"
+
+
+def parse(path):
+    text = path.read_text()
+    meta, body = {}, text
+    if text.startswith("---\n"):
+        head, _, body = text[3:].partition("\n---\n")
+        for line in head.splitlines():
+            k, _, v = line.partition(": ")
+            if k:
+                meta[k] = v
+    return meta, body.strip("\n")
+
+
+def write_atomic(path, text, mode=None):
+    tmp = path.with_name(f".tmp-{path.name}-{secrets.token_hex(4)}")
+    tmp.write_text(text)
+    if mode is not None:
+        tmp.chmod(mode)
+    os.rename(tmp, path)
+
+
+def digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def script_version(path):
+    try:
+        m = re.search(r"^VERSION = (\d+)", path.read_text(), re.M)
+    except OSError:
+        return -1
+    return int(m.group(1)) if m else 0
+
+
+class Store:
+    def __init__(self):
+        self.host, self.cloudlab = hostname()
+        self.root = find_root(self.host, self.cloudlab)
+        self.agents = self.root / "agents"
+        self.mail = self.root / "mail"
+        self.inbox = self.root / "inbox"
+        self.ledger = self.root / "ledger"
+        self.down = self.root / "DOWN"
+
+    def ensure(self):
+        for d in (self.agents, self.mail, self.ledger, self.inbox):
+            d.mkdir(parents=True, exist_ok=True)
+        for d in (self.mail, self.ledger):
+            try:
+                d.chmod(0o3775)  # sticky: only a file's owner can delete it
+            except OSError:
+                pass
+        here = Path(__file__).resolve().parent
+        for script in ("amail", "amail-tui"):
+            src, dst = here / script, self.root / script
+            if src.exists() and src != dst and script_version(src) > script_version(dst):
+                write_atomic(dst, src.read_text(), 0o775)
+        bindir = Path.home() / ".local" / "bin"
+        try:
+            bindir.mkdir(parents=True, exist_ok=True)
+            link = bindir / "amail"
+            if link.is_symlink() or not link.exists():
+                if link.is_symlink():
+                    link.unlink()
+                link.symlink_to(self.root / "amail")
+        except OSError:
+            pass
+
+    def command(self):
+        return "amail" if shutil.which("amail") else str(self.root / "amail")
+
+    def agent(self, name, must=True):
+        p = self.agents / f"{name}.md"
+        if not p.exists():
+            if must:
+                die(f"unknown agent {name!r}; see: amail who")
+            return None
+        return parse(p)[0]
+
+    def save_agent(self, meta):
+        write_atomic(self.agents / f"{meta['name']}.md", render(meta, AGENT_FIELDS))
+
+    def active(self, name):
+        """Follow the supersedes chain to the current agent name."""
+        for _ in range(32):
+            nxt = self.agent(name).get("superseded_by")
+            if not nxt:
+                return name
+            name = nxt
+        die(f"supersede loop at {name!r}")
+
+    def heartbeat(self, name):
+        return self.inbox / name / "heartbeat"
+
+    def beat(self, name):
+        try:
+            self.heartbeat(name).touch()  # NFS stamps server time
+        except OSError:
+            pass
+
+    def successors(self, name):
+        """name followed by everything that superseded it."""
+        out = [name]
+        while len(out) < 32:
+            meta = self.agent(out[-1], must=False) or {}
+            if not meta.get("superseded_by"):
+                break
+            out.append(meta["superseded_by"])
+        return out
+
+    def box(self, name, sub):
+        return self.inbox / name / sub
+
+    def message(self, mid):
+        p = self.mail / f"{mid}.md"
+        if not p.exists():
+            die(f"no message {mid!r}")
+        return parse(p)
+
+
+def body_arg(text):
+    body = sys.stdin.read() if text == "-" else text
+    if not body.strip():
+        die("empty message")
+    return body
+
+
+def down_notice(st):
+    """DOWN_MSG plus who disabled amail and why, or None while amail is up."""
+    try:
+        meta = parse(st.down)[0]
+    except OSError:
+        return None
+    reason = f": {meta['reason']}" if meta.get("reason") else ""
+    return f"{DOWN_MSG}\n(down since {meta.get('since', '?')}, by {meta.get('by', '?')}{reason})"
+
+
+def require_up(st):
+    notice = down_notice(st)
+    if notice:
+        print(notice)
+        sys.exit(EX_TEMPFAIL)
+
+
+def deliver(st, sender, to, body, re_id=None):
+    require_up(st)
+    me = st.agent(sender)
+    if me.get("status") != "active":
+        die(f"{sender!r} is {me.get('status')}; register a new name")
+    if to == BROADCAST:
+        targets = sorted(p.stem for p in st.agents.glob("*.md")
+                         if st.agent(p.stem).get("status") == "active" and p.stem != sender)
+    else:
+        targets = sorted({st.active(t) for t in to.split(",") if t})
+    if not targets:
+        die("no recipients")
+    thread = None
+    if re_id:
+        thread = st.message(re_id)[0].get("thread") or re_id
+    t = now_utc()
+    mid = f"{t:%Y%m%dT%H%M%S}{t.microsecond // 1000:03d}Z-{sender}-{secrets.token_hex(3)}"
+    meta = {"id": mid, "date": t.isoformat(timespec="seconds"), "from": sender, "to": to,
+            "model": me.get("model"), "project": me.get("project"), "user": me.get("user"),
+            "host": st.host.split(".")[0], "re": re_id, "thread": thread or mid,
+            "delivered": ", ".join(targets)}
+    src = st.mail / f"{mid}.md"
+    write_atomic(src, render(meta, MSG_FIELDS, body), 0o444)
+    write_atomic(st.ledger / f"{mid}.sha256", digest(src) + "\n", 0o444)
+    for r in targets:
+        dst = st.box(r, "new") / src.name
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            os.link(src, dst)
+        except OSError:
+            write_atomic(dst, src.read_text(), 0o444)
+    print(f"{mid} -> {', '.join(targets)}")
+
+
+def require_user():
+    if not sys.stdin.isatty():
+        die("down/up are for users: run it yourself in a terminal")
+
+
+def cmd_down(st, a):
+    require_user()
+    meta = {"since": now_utc().isoformat(timespec="seconds"),
+            "by": f"{getpass.getuser()}@{st.host.split('.')[0]}", "reason": " ".join(a.reason)}
+    write_atomic(st.down, render(meta, ["since", "by", "reason"]), 0o664)
+    print(f"amail is down at {st.root}; sends are refused until: amail up")
+
+
+def cmd_up(st, a):
+    require_user()
+    if not st.down.exists():
+        print("amail is already up")
+        return
+    st.down.unlink()
+    print("amail is up")
+
+
+def cmd_init(st, a):
+    st.ensure()
+    print(f"amail ready at {st.root}\ncommand: {st.command()}\nbrowse: {st.root / 'amail-tui'}")
+
+
+def cmd_register(st, a):
+    check_name(a.name)
+    st.ensure()
+    old = st.agent(a.name, must=False)
+    if old and old.get("status") == "superseded":
+        die(f"{a.name!r} was superseded by {old.get('superseded_by')!r}; pick a new name")
+    if a.supersedes:
+        if a.supersedes == a.name:
+            die("an agent can't supersede itself")
+        prev = st.agent(a.supersedes)
+    t = now_utc().isoformat(timespec="seconds")
+    st.save_agent({"name": a.name, "model": a.model, "project": a.project,
+                   "user": getpass.getuser(), "host": st.host, "registered": t, "status": "active",
+                   "supersedes": a.supersedes})
+    new, cur = st.box(a.name, "new"), st.box(a.name, "cur")
+    new.mkdir(parents=True, exist_ok=True)
+    cur.mkdir(parents=True, exist_ok=True)
+    if a.supersedes:
+        prev.update(status="superseded", superseded_by=a.name)
+        st.save_agent(prev)
+        for f in st.box(a.supersedes, "new").glob("*.md"):
+            os.rename(f, new / f.name)
+    watch = st.inbox / a.name / "watch.sh"
+    code = WATCH_SH.format(name=a.name, new=new, hb=st.heartbeat(a.name), down=st.down,
+                           down_msg=DOWN_MSG, up_msg=UP_MSG, cmd=st.root / "amail")
+    write_atomic(watch, code)
+    watch.chmod(0o775)
+    cmd = st.command()
+    print(f"registered {a.name} ({a.model}, {a.project})"
+          + (f", superseding {a.supersedes}" if a.supersedes else ""))
+    print(f"command: {cmd}")
+    print(f"watcher: {watch}\n")
+    print(code, end="")
+
+
+def cmd_send(st, a):
+    if a.to != BROADCAST:
+        for t in a.to.split(","):
+            check_name(t)
+    deliver(st, a.sender, a.to, body_arg(a.message), a.re)
+
+
+def cmd_reply(st, a):
+    meta = st.message(a.id)[0]
+    to = BROADCAST if a.all else meta["from"]
+    deliver(st, a.sender, to, body_arg(a.message), a.id)
+
+
+def listing(st, name, subs):
+    rows = []
+    for sub in subs:
+        for f in st.box(name, sub).glob("*.md"):
+            rows.append((f.name, sub, f))
+    return sorted(rows)
+
+
+def show(meta, body):
+    re_part = f"  re: {meta['re']}" if meta.get("re") else ""
+    print(f"=== {meta.get('id')}\n{meta.get('date')}  {meta.get('from')} -> {meta.get('to')}"
+          f"  [{meta.get('model')} @ {meta.get('user', '?')}@{meta.get('host')}, {meta.get('project')}]"
+          f"{re_part}\n")
+    print(body + "\n")
+
+
+def cmd_inbox(st, a):
+    st.agent(a.name)
+    st.beat(a.name)
+    if down_notice(st):
+        print(down_notice(st) + "\n")
+    rows = listing(st, a.name, ["new", "cur"] if a.all else ["new"])
+    if not rows:
+        print("no unread mail" if not a.all else "no mail")
+    for _, sub, f in rows:
+        meta, body = parse(f)
+        first = body.strip().splitlines()[0] if body.strip() else ""
+        mark = "*" if sub == "new" else " "
+        print(f"{mark} {meta.get('id')}  {meta.get('from')} -> {meta.get('to')}  {first[:60]}")
+
+
+def cmd_read(st, a):
+    st.agent(a.name)
+    st.beat(a.name)
+    if down_notice(st):
+        print(down_notice(st) + "\n")
+    rows = listing(st, a.name, ["new", "cur"] if a.ids else ["new"])
+    if a.ids:
+        rows = [r for r in rows if r[0][:-3] in a.ids]
+        missing = set(a.ids) - {r[0][:-3] for r in rows}
+        if missing:
+            die(f"not in {a.name}'s inbox: {', '.join(sorted(missing))}")
+    if not rows:
+        print("no unread mail")
+    for fname, sub, f in rows:
+        show(*parse(f))
+        if sub == "new" and not a.peek:
+            os.rename(f, st.box(a.name, "cur") / fname)
+
+
+def cmd_thread(st, a):
+    root = st.message(a.id)[0].get("thread") or a.id
+    for f in sorted(st.mail.glob("*.md")):
+        meta, body = parse(f)
+        if meta.get("thread") == root:
+            show(meta, body)
+
+
+def ago(seconds):
+    for unit, n in (("d", 86400), ("h", 3600), ("m", 60)):
+        if seconds >= n:
+            return f"{int(seconds // n)}{unit} ago"
+    return f"{max(int(seconds), 0)}s ago"
+
+
+def server_now(st):
+    """Current time as the NFS server sees it, so heartbeat ages ignore client clock skew."""
+    probe = st.root / f".now-{secrets.token_hex(4)}"
+    try:
+        probe.touch()
+        t = probe.stat().st_mtime
+        probe.unlink()
+        return t
+    except OSError:
+        return time.time()
+
+
+def restore(src, dst):
+    try:
+        os.link(src, dst)
+    except FileExistsError:
+        pass
+    except OSError:
+        write_atomic(dst, src.read_text(), 0o444)
+
+
+def integrity(st, repair=False):
+    """Check mail/ against ledger/ and the inbox copies. Repair only adds files, never removes."""
+    if repair:
+        st.ledger.mkdir(exist_ok=True)
+    rep = {k: [] for k in ("missing", "altered", "unledgered", "undelivered", "restored")}
+    ledger = {p.name[:-7]: p for p in st.ledger.glob("*.sha256")}
+    mail = {p.stem: p for p in st.mail.glob("*.md")}
+    copies = {}
+    for p in st.inbox.glob("*/*/*.md"):
+        copies.setdefault(p.stem, []).append(p)
+    for mid in sorted(set(ledger) - set(mail)):
+        want = ledger[mid].read_text().strip()
+        src = next((p for p in copies.get(mid, []) if digest(p) == want), None)
+        if repair and src:
+            restore(src, st.mail / f"{mid}.md")
+            mail[mid] = st.mail / f"{mid}.md"
+            rep["restored"].append(f"mail/{mid}.md")
+        else:
+            rep["missing"].append(f"mail/{mid}.md")
+    for mid, p in sorted(mail.items()):
+        if mid not in ledger:
+            if repair:
+                write_atomic(st.ledger / f"{mid}.sha256", digest(p) + "\n", 0o444)
+                rep["restored"].append(f"ledger/{mid}.sha256")
+            else:
+                rep["unledgered"].append(f"mail/{mid}.md")
+        elif digest(p) != ledger[mid].read_text().strip():
+            rep["altered"].append(f"mail/{mid}.md")
+            continue
+        holders = {c.parent.parent.name for c in copies.get(mid, [])}
+        for name in filter(None, parse(p)[0].get("delivered", "").split(", ")):
+            chain = st.successors(name)
+            if holders & set(chain):
+                continue
+            dst = st.box(chain[-1], "cur") / p.name
+            if repair and dst.parent.is_dir():
+                restore(p, dst)
+                rep["restored"].append(f"inbox/{chain[-1]}/cur/{p.name}")
+            else:
+                rep["undelivered"].append(f"inbox/{chain[-1]}/*/{p.name}")
+    return rep
+
+
+def cmd_verify(st, a):
+    rep = integrity(st, repair=not a.check)
+    bad = False
+    for k, items in rep.items():
+        print(f"{k}: {len(items)}")
+        for i in items:
+            print(f"  {i}")
+        bad |= bool(items) and k != "restored"
+    sys.exit(1 if bad else 0)
+
+
+def cmd_who(st, a):
+    now = server_now(st)
+    for p in sorted(st.agents.glob("*.md")):
+        m = parse(p)[0]
+        if m.get("status") != "active" and not a.all:
+            continue
+        try:
+            seen = "checked " + ago(now - st.heartbeat(m["name"]).stat().st_mtime)
+        except OSError:
+            seen = "never checked"
+        extra = f" -> {m['superseded_by']}" if m.get("superseded_by") else ""
+        where = f"{m.get('user', '?')}@{m.get('host', '').split('.')[0]}"
+        print(f"{m['name']:<20} {m.get('model',''):<20} {m.get('project',''):<20} "
+              f"{where:<20} {seen:<18} {m.get('status')}{extra}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="amail", description="Mail between independent agents.")
+    sp = ap.add_subparsers(dest="cmd", required=True)
+
+    sp.add_parser("init", help="set up the amail root (outside CloudLab: only when a user asks)")
+
+    p = sp.add_parser("register", help="register an agent, create its inbox, print watcher")
+    p.add_argument("name")
+    p.add_argument("model")
+    p.add_argument("project")
+    p.add_argument("--supersedes", metavar="OLD")
+
+    p = sp.add_parser("send", help="send a message ('-' reads body from stdin)")
+    p.add_argument("sender", metavar="from")
+    p.add_argument("to", help=f"agent name, comma list, or '{BROADCAST}'")
+    p.add_argument("message")
+    p.add_argument("--re", metavar="ID", help="message this replies to")
+
+    p = sp.add_parser("reply", help="reply to a message's sender")
+    p.add_argument("sender", metavar="from")
+    p.add_argument("id")
+    p.add_argument("message")
+    p.add_argument("--all", action="store_true", help=f"reply to '{BROADCAST}' instead")
+
+    p = sp.add_parser("inbox", help="list unread mail")
+    p.add_argument("name")
+    p.add_argument("--all", action="store_true", help="include read mail")
+
+    p = sp.add_parser("read", help="print unread mail (or given ids) and mark read")
+    p.add_argument("name")
+    p.add_argument("ids", nargs="*")
+    p.add_argument("--peek", action="store_true", help="don't mark read")
+
+    p = sp.add_parser("thread", help="print the whole conversation containing a message")
+    p.add_argument("id")
+
+    p = sp.add_parser("who", help="list registered agents")
+    p.add_argument("--all", action="store_true", help="include superseded agents")
+
+    p = sp.add_parser("down", help="(users only) temporarily refuse all sends")
+    p.add_argument("reason", nargs="*")
+    sp.add_parser("up", help="(users only) restore sending")
+
+    p = sp.add_parser("verify", help="check for deleted/altered mail; restore what it can")
+    p.add_argument("--check", action="store_true", help="report only, restore nothing")
+
+    a = ap.parse_args()
+    os.umask(0o002)
+    st = Store()
+    if a.cmd != "init" and not st.agents.is_dir():
+        if not st.cloudlab:
+            die(f"amail is not enabled on this machine ({st.root} missing); "
+                "a user enables it with: amail init")
+        if a.cmd != "register":
+            die(f"amail not set up at {st.root}; run: amail register ...")
+    globals()[f"cmd_{a.cmd}"](st, a)
+
+
+if __name__ == "__main__":
+    main()

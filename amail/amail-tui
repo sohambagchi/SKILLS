@@ -1,0 +1,392 @@
+#!/usr/bin/env python3
+"""amail-tui: read-only terminal browser for amail (agents, inboxes, all mail, threads).
+
+It never moves, marks, writes or deletes anything. Needs the `amail` script next to it.
+"""
+import curses
+import importlib.machinery
+import importlib.util
+import textwrap
+import time
+from pathlib import Path
+
+VERSION = 5
+REFRESH_SECS = 5
+LEFT_W = 38
+HELP = "Tab pane  j/k move  Enter open  / filter  v verify  r refresh  ? help  q quit   [read-only]"
+HELP_TEXT = """amail-tui (read-only)
+
+Left pane: ALL MAIL, then every agent (active first, then superseded).
+  colour = last mail check: green < 2m, yellow < 1h, red older or never
+  n/m    = unread / total messages in that inbox
+Right pane: messages for the selection, newest first. * = unread by that agent.
+
+  Tab, h/l, left/right   switch pane
+  j/k, up/down           move          PgUp/PgDn, g/G   page, top/bottom
+  Enter                  open agent / message
+  /                      filter (substring of headers + body); empty clears
+  v                      integrity report (deleted / altered mail)
+  r                      refresh now (auto every 5s)
+  q, Esc                 back / quit
+
+Message view:  t whole thread   u parent message   j/k space b g G scroll   q back
+
+Nothing here marks mail read. To repair deleted files run: amail verify
+"""
+
+GREEN, YELLOW, RED, DIM, HEAD, SEL, WARN = range(1, 8)
+
+
+def load_amail():
+    path = Path(__file__).resolve().with_name("amail")
+    loader = importlib.machinery.SourceFileLoader("amail", str(path))
+    mod = importlib.util.module_from_spec(importlib.util.spec_from_loader("amail", loader))
+    loader.exec_module(mod)
+    return mod
+
+
+am = load_amail()
+
+
+def age_text(age):
+    return "never" if age is None else am.ago(age)[:-4]
+
+
+def age_color(age):
+    if age is None:
+        return RED
+    return GREEN if age < 120 else YELLOW if age < 3600 else RED
+
+
+class App:
+    def __init__(self, scr, st):
+        self.scr, self.st = scr, st
+        self.cache = {}  # message file name -> (meta, body); messages are write-once
+        self.focus = 0  # 0 = agents, 1 = messages
+        self.sel_agent = None  # None = ALL MAIL
+        self.mi = self.mtop = self.atop = 0
+        self.filter = ""
+        self.report = None
+        self.verify()
+        self.refresh()
+
+    # data
+
+    def verify(self):
+        self.report = am.integrity(self.st, repair=False)
+
+    def issues(self):
+        return sum(len(v) for k, v in self.report.items() if k != "restored")
+
+    def refresh(self):
+        st, now = self.st, time.time()
+        agents = []
+        for p in st.agents.glob("*.md"):
+            meta = am.parse(p)[0]
+            name = meta.get("name", p.stem)
+            items = [(f.name, sub) for sub in ("new", "cur") for f in st.box(name, sub).glob("*.md")]
+            try:
+                age = now - st.heartbeat(name).stat().st_mtime
+            except OSError:
+                age = None
+            agents.append({"name": name, "meta": meta, "age": age, "items": sorted(items, reverse=True),
+                           "unread": sum(1 for _, s in items if s == "new")})
+        agents.sort(key=lambda a: (a["meta"].get("status") != "active", a["name"]))
+        self.agents = agents
+        self.all = [(f.name, None) for f in sorted(st.mail.glob("*.md"), reverse=True)]
+        self.last = now
+
+    def load(self, fname, owner=None, sub=None):
+        if fname not in self.cache:
+            paths = [self.st.mail / fname]
+            if owner:
+                paths += [self.st.box(owner, s) / fname for s in (sub, "cur", "new")]
+            for p in paths:
+                try:
+                    self.cache[fname] = am.parse(p)
+                    break
+                except OSError:
+                    continue
+            else:
+                return {"id": fname[:-3], "from": "?", "to": "?"}, "(message file missing)"
+        return self.cache[fname]
+
+    def agent_rows(self):
+        return [None] + self.agents
+
+    def current(self):
+        rows = self.agent_rows()
+        for i, a in enumerate(rows):
+            if (a and a["name"]) == self.sel_agent:
+                return i, a
+        self.sel_agent = None
+        return 0, None
+
+    def messages(self):
+        _, a = self.current()
+        src = self.all if a is None else a["items"]
+        out, needle = [], self.filter.lower()
+        for fname, sub in src:
+            meta, body = self.load(fname, a and a["name"], sub)
+            if needle and needle not in (" ".join(meta.values()) + "\n" + body).lower():
+                continue
+            out.append((meta, body, sub))
+        return out
+
+    def thread(self, meta):
+        root = meta.get("thread") or meta.get("id")
+        msgs = [self.load(f) for f, _ in reversed(self.all)]
+        return [m for m in msgs if (m[0].get("thread") or m[0].get("id")) == root]
+
+    # drawing
+
+    def put(self, y, x, text, attr=0, width=None):
+        H, W = self.scr.getmaxyx()
+        if y < 0 or y >= H or x >= W:
+            return
+        width = min(width or W - x, W - x)
+        try:
+            self.scr.addnstr(y, x, text.ljust(width) if attr & curses.A_REVERSE else text, width, attr)
+        except curses.error:
+            pass
+
+    def color(self, n):
+        return curses.color_pair(n) if curses.has_colors() else 0
+
+    def draw(self):
+        s = self.scr
+        s.erase()
+        H, W = s.getmaxyx()
+        ai, cur = self.current()
+        n_issue = self.issues()
+        warn = f" ! {n_issue} integrity issues (v) " if n_issue else ""
+        if self.st.down.exists():
+            warn = " AMAIL DOWN (amail up)" + warn
+        tail = f"  {len(self.agents)} agents  {len(self.all)} messages  READ-ONLY "
+        root = str(self.st.root)
+        room = W - len(warn) - len(tail) - 8
+        if len(root) > room:
+            root = "..." + root[-max(room - 3, 0):] if room > 3 else ""
+        self.put(0, 0, f" amail  {root}{tail}", self.color(HEAD) | curses.A_REVERSE)
+        if warn:
+            self.put(0, max(0, W - len(warn)), warn, self.color(WARN) | curses.A_BOLD)
+        lw = min(LEFT_W, W // 2)
+        body_h = H - 2
+
+        # left: agents
+        rows = self.agent_rows()
+        if ai < self.atop:
+            self.atop = ai
+        elif ai >= self.atop + body_h:
+            self.atop = ai - body_h + 1
+        for y, a in enumerate(rows[self.atop:self.atop + body_h], start=1):
+            idx = self.atop + y - 1
+            sel = curses.A_REVERSE if idx == ai else 0
+            bold = curses.A_BOLD if self.focus == 0 and idx == ai else 0
+            if a is None:
+                self.put(y, 0, f" ALL MAIL {len(self.all):>{lw - 11}}", sel | bold, lw)
+                continue
+            superseded = a["meta"].get("status") != "active"
+            attr = self.color(DIM if superseded else age_color(a["age"])) | curses.A_DIM * superseded
+            counts = f"{a['unread']}/{len(a['items'])} {age_text(a['age']):>5}"
+            self.put(y, 0, f" {'x' if superseded else '*'} {a['name'][:lw - len(counts) - 5]}"
+                           .ljust(lw - len(counts) - 1) + counts, attr | sel | bold, lw)
+        for y in range(1, H - 1):
+            self.put(y, lw, "|", self.color(DIM))
+
+        # right: agent info + messages
+        x, rw = lw + 2, W - lw - 2
+        y0 = 1
+        if cur:
+            m = cur["meta"]
+            info = [f"{cur['name']}  {m.get('model', '')}  project={m.get('project', '')}  {m.get('user', '?')}@{m.get('host', '')}",
+                    f"registered {m.get('registered', '?')}  status={m.get('status')}"
+                    + (f"  supersedes={m['supersedes']}" if m.get("supersedes") else "")
+                    + (f"  superseded_by={m['superseded_by']}" if m.get("superseded_by") else ""),
+                    f"last checked mail: {'never' if cur['age'] is None else am.ago(cur['age'])}"]
+            for i, line in enumerate(info):
+                self.put(y0 + i, x, line, self.color(age_color(cur["age"])) if i == 2 else curses.A_BOLD, rw)
+            y0 += len(info) + 1
+        if self.filter:
+            self.put(y0, x, f"filter: {self.filter}", self.color(YELLOW), rw)
+            y0 += 1
+        msgs = self.messages()
+        self.mi = max(0, min(self.mi, len(msgs) - 1))
+        list_h = H - 1 - y0
+        if self.mi < self.mtop:
+            self.mtop = self.mi
+        elif self.mi >= self.mtop + list_h:
+            self.mtop = self.mi - list_h + 1
+        if not msgs:
+            self.put(y0, x, "(no messages)", self.color(DIM), rw)
+        for i, (meta, body, sub) in enumerate(msgs[self.mtop:self.mtop + list_h]):
+            idx = self.mtop + i
+            first = next((l for l in body.splitlines() if l.strip()), "")
+            date = meta.get("date", "")[5:16].replace("T", " ")
+            line = f"{'*' if sub == 'new' else ' '} {date}  {meta.get('from', '?')} -> {meta.get('to', '?')}  {first}"
+            attr = curses.A_BOLD if sub == "new" else 0
+            if idx == self.mi:
+                attr |= curses.A_REVERSE | (curses.A_BOLD if self.focus == 1 else 0)
+            self.put(y0 + i, x, line, attr, rw)
+        self.put(H - 1, 0, HELP, self.color(DIM), W - 1)
+        s.refresh()
+        return msgs
+
+    # views
+
+    def pager(self, title, lines, extra=""):
+        top = 0
+        while True:
+            H, W = self.scr.getmaxyx()
+            self.scr.erase()
+            self.put(0, 0, f" {title} ", self.color(HEAD) | curses.A_REVERSE)
+            for i, (line, attr) in enumerate(lines[top:top + H - 2], start=1):
+                self.put(i, 0, line, attr)
+            pos = f" {min(top + H - 2, len(lines))}/{len(lines)} "
+            self.put(H - 1, 0, f"j/k scroll  space/b page  g/G ends  {extra}q back   {pos}", self.color(DIM), W - 1)
+            self.scr.refresh()
+            k = self.scr.getch()
+            page = max(1, H - 3)
+            last = max(0, len(lines) - (H - 2))
+            if k in (ord("q"), 27, curses.KEY_LEFT, ord("h")):
+                return None
+            if k in (ord("j"), curses.KEY_DOWN, 10, curses.KEY_ENTER):
+                top = min(last, top + 1)
+            elif k in (ord("k"), curses.KEY_UP):
+                top = max(0, top - 1)
+            elif k in (ord(" "), curses.KEY_NPAGE):
+                top = min(last, top + page)
+            elif k in (ord("b"), curses.KEY_PPAGE):
+                top = max(0, top - page)
+            elif k == ord("g"):
+                top = 0
+            elif k == ord("G"):
+                top = last
+            elif k != -1 and chr(k) in "tu" and chr(k) in extra:
+                return chr(k)
+
+    def msg_lines(self, meta, body, W):
+        lines = [(f"{k:>9}: {meta[k]}", curses.A_BOLD if k in ("from", "to") else self.color(DIM))
+                 for k in am.MSG_FIELDS if meta.get(k)]
+        lines.append(("-" * min(W - 1, 80), self.color(DIM)))
+        for para in body.splitlines():
+            for l in textwrap.wrap(para, max(20, W - 1), replace_whitespace=False) or [""]:
+                lines.append((l, 0))
+        return lines
+
+    def open_message(self, meta, body):
+        while True:
+            W = self.scr.getmaxyx()[1]
+            extra = "t thread  " + ("u parent  " if meta.get("re") else "")
+            k = self.pager(meta.get("id", ""), self.msg_lines(meta, body, W), extra)
+            if k == "t":
+                msgs = self.thread(meta)
+                lines = []
+                for m, b in msgs:
+                    mark = "  <-- current" if m.get("id") == meta.get("id") else ""
+                    lines.append((f"=== {m.get('date', '')}  {m.get('from')} -> {m.get('to')}{mark}",
+                                  self.color(HEAD) | curses.A_BOLD))
+                    lines += self.msg_lines(m, b, W) + [("", 0)]
+                self.pager(f"thread {meta.get('thread')} ({len(msgs)} messages)", lines)
+            elif k == "u":
+                meta, body = self.load(f"{meta['re']}.md")
+            else:
+                return
+
+    def show_report(self):
+        self.verify()
+        lines = []
+        for k, items in self.report.items():
+            if k == "restored":
+                continue
+            attr = self.color(RED) | curses.A_BOLD if items else self.color(GREEN)
+            lines.append((f"{k}: {len(items)}", attr))
+            lines += [(f"  {i}", 0) for i in items]
+        lines += [("", 0), ("missing: in ledger but deleted from mail/", self.color(DIM)),
+                  ("altered: content no longer matches its ledger checksum", self.color(DIM)),
+                  ("unledgered: no checksum recorded (older amail, or planted)", self.color(DIM)),
+                  ("undelivered: recipient's inbox copy was deleted", self.color(DIM)),
+                  ("", 0), ("Restore what can be restored with: amail verify", curses.A_BOLD)]
+        self.pager("integrity report (read-only check)", lines)
+
+    def prompt(self, label):
+        H, W = self.scr.getmaxyx()
+        self.put(H - 1, 0, " " * (W - 1))
+        self.put(H - 1, 0, label, curses.A_BOLD)
+        curses.echo()
+        curses.curs_set(1)
+        try:
+            text = self.scr.getstr(H - 1, len(label), max(1, W - len(label) - 1)).decode(errors="replace")
+        except curses.error:
+            text = ""
+        curses.noecho()
+        curses.curs_set(0)
+        return text.strip()
+
+    def run(self):
+        self.scr.timeout(1000)
+        while True:
+            if time.time() - self.last >= REFRESH_SECS:
+                self.refresh()
+            msgs = self.draw()
+            k = self.scr.getch()
+            if k == -1:
+                continue
+            H = self.scr.getmaxyx()[0]
+            ai, cur = self.current()
+            rows = self.agent_rows()
+            if k in (ord("q"), 27):
+                if self.focus == 1:
+                    self.focus = 0
+                else:
+                    return
+            elif k in (9, curses.KEY_BTAB):
+                self.focus ^= 1
+            elif k in (curses.KEY_LEFT, ord("h")):
+                self.focus = 0
+            elif k in (curses.KEY_RIGHT, ord("l")):
+                self.focus = 1
+            elif k in (10, 13, curses.KEY_ENTER):
+                if self.focus == 0:
+                    self.focus = 1
+                elif msgs:
+                    self.open_message(*msgs[self.mi][:2])
+            elif k == ord("/"):
+                self.filter = self.prompt("filter: ")
+                self.mi = self.mtop = 0
+            elif k == ord("r"):
+                self.refresh()
+                self.verify()
+            elif k == ord("v"):
+                self.show_report()
+            elif k == ord("?"):
+                self.pager("help", [(l, 0) for l in HELP_TEXT.splitlines()])
+            else:
+                step = {ord("j"): 1, curses.KEY_DOWN: 1, ord("k"): -1, curses.KEY_UP: -1,
+                        curses.KEY_NPAGE: H - 4, curses.KEY_PPAGE: -(H - 4),
+                        ord("g"): -10**9, ord("G"): 10**9}.get(k)
+                if step is None:
+                    continue
+                if self.focus == 0:
+                    ai = max(0, min(len(rows) - 1, ai + step))
+                    self.sel_agent = rows[ai] and rows[ai]["name"]
+                    self.mi = self.mtop = 0
+                else:
+                    self.mi = max(0, min(len(msgs) - 1, self.mi + step))
+
+
+def main(scr):
+    curses.curs_set(0)
+    if curses.has_colors():
+        curses.use_default_colors()
+        for n, c in ((GREEN, curses.COLOR_GREEN), (YELLOW, curses.COLOR_YELLOW), (RED, curses.COLOR_RED),
+                     (DIM, -1), (HEAD, curses.COLOR_CYAN), (SEL, -1), (WARN, curses.COLOR_RED)):
+            curses.init_pair(n, c, -1)
+    App(scr, st).run()
+
+
+if __name__ == "__main__":
+    st = am.Store()  # host check and root discovery happen before curses starts
+    if not st.agents.is_dir():
+        am.die(f"amail not set up at {st.root}; run: amail init")
+    curses.wrapper(main)
