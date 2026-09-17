@@ -26,6 +26,7 @@ Use the second when choosing a new branch's Y, so an abandoned branch's Y is nev
 |---|---|
 | First commit of a project | `0.0.0` |
 | Another commit on the current branch | bump Z |
+| A minor one-step fix — too small for a branch | bump Z on the current branch |
 | First commit of a new branch | lowest unused Y for the current X, Z = 0 |
 | MVP — central logic working end-to-end | `1.0.0` |
 | A significant number of Y branches converged | bump X, Y = Z = 0 |
@@ -38,6 +39,8 @@ Use the second when choosing a new branch's Y, so an abandoned branch's Y is nev
 ## Branching
 
 A new feature or a larger issue gets its own branch. Create it and commit immediately, before any work — that commit fixes the branch's Y.
+
+Not everything earns a branch. A minor fix done in one step — a typo, a one-line correction, a small doc edit — stays on the current branch and just bumps Z. Don't spend a Y on it.
 
 ```sh
 git switch -c <branch>
