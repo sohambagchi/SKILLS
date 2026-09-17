@@ -29,7 +29,7 @@ Personal agent skills. One skill per directory, each loadable alone, all composa
 Clone with submodules:
 
 ```sh
-git clone --recurse-submodules git@github.com:<you>/SKILLS.git ~/dev/SKILLS
+git clone --recurse-submodules git@github.com:sohambagchi/SKILLS.git ~/dev/SKILLS
 ```
 
 Symlink the skill directories into each agent's user skill directory:
