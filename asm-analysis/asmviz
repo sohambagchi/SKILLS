@@ -1,0 +1,1553 @@
+#!/usr/bin/env python3
+"""asmviz: reference tooling for the asm-analysis bundle format.
+
+Four subcommands, no dependencies beyond the standard library:
+
+  check   validate a bundle against the format and its invariants, and validate an
+          annotation store against that bundle
+  stats   counts, coverage, and the mapping-quality counters
+  chunks  propose a partition of the corpus into annotation work chunks
+  serve   serve the reference 2xN workspace, reading and writing the annotation store
+
+Nothing here knows anything about a particular project, language or toolchain. Every
+project-specific fact is read from the bundle. If this script ever needs to test a
+variant by name, the bundle is underspecified -- fix the format, not this file.
+
+See SKILL.md for the format itself; section references below point into it.
+"""
+import argparse
+import gzip
+import http.server
+import io
+import json
+import os
+import re
+import socketserver
+import sys
+import urllib.parse
+from collections import defaultdict
+
+SCHEMA = 1
+KEY_VERSION = "1"
+
+# ---------------------------------------------------------------- keys (SKILL.md §3)
+
+_ESCAPE = {"%": "%25", "|": "%7C"}
+
+
+def _enc(part):
+    if part is None:
+        return "-"
+    s = str(part)
+    for raw, sub in _ESCAPE.items():
+        s = s.replace(raw, sub)
+    return s or "-"
+
+
+def _dec(part):
+    return urllib.parse.unquote(part)
+
+
+def norm_addr(addr):
+    """Canonical lowercase 0x spelling. Normalizing here -- and only here -- is what
+    stops 0xA1B and a1b becoming two rows."""
+    if addr is None:
+        return None
+    if isinstance(addr, int):
+        return hex(addr)
+    s = str(addr).strip().lower()
+    if s.startswith("0x"):
+        s = s[2:]
+    s = s.lstrip("0") or "0"
+    return "0x" + s
+
+
+def parse_addr(addr):
+    if isinstance(addr, int):
+        return addr
+    try:
+        return int(str(addr), 16)
+    except (TypeError, ValueError):
+        return None
+
+
+def high_key(variant, unit, file, line):
+    return "|".join(["hi", KEY_VERSION, _enc(variant), _enc(unit), _enc(file), _enc(line)])
+
+
+def low_key(kind, variant, artifact, address):
+    return "|".join(
+        ["lo", KEY_VERSION, _enc(kind), _enc(variant), _enc(artifact), _enc(norm_addr(address))]
+    )
+
+
+def container_key(variant, artifact, start, stop):
+    return "|".join(
+        ["ct", KEY_VERSION, _enc(variant), _enc(artifact), _enc(norm_addr(start)), _enc(norm_addr(stop))]
+    )
+
+
+KEY_ARITY = {"hi": 6, "lo": 6, "ct": 6}
+
+
+def parse_key(key):
+    """-> (space, dict) or (None, reason). Keys are opaque everywhere else."""
+    if not isinstance(key, str) or "|" not in key:
+        return None, "not a key string"
+    parts = key.split("|")
+    space = parts[0]
+    if space not in KEY_ARITY:
+        return None, "unknown key space %r" % space
+    if len(parts) != KEY_ARITY[space]:
+        return None, "%s key has %d components, expected %d" % (space, len(parts), KEY_ARITY[space])
+    if parts[1] != KEY_VERSION:
+        return None, "key space version %r is not %r" % (parts[1], KEY_VERSION)
+    vals = [_dec(p) for p in parts[2:]]
+    if space == "hi":
+        return "hi", dict(zip(("variant", "unit", "file", "line"), vals))
+    if space == "lo":
+        return "lo", dict(zip(("kind", "variant", "artifact", "address"), vals))
+    return "ct", dict(zip(("variant", "artifact", "start", "stop"), vals))
+
+
+def project_high_key(key, scope):
+    """The auto-link projection (§3): two high rows correspond automatically when
+    their keys are equal after projecting onto the declared scope."""
+    space, fields = parse_key(key)
+    if space != "hi":
+        return None
+    return "|".join(_enc(fields.get(c)) for c in scope)
+
+
+# ------------------------------------------------------------------- bundle loading
+
+JS_WRAPPER = re.compile(r"^\s*(?:window\.)?[A-Za-z_$][\w$]*\s*=\s*", re.S)
+
+
+def load_bundle(path):
+    """Accepts bundle.json, or the bundle.js wrapper form that lets a workspace open
+    over file:// where fetch is blocked."""
+    with open(path, "r", encoding="utf-8") as fh:
+        text = fh.read()
+    stripped = text.lstrip()
+    if not stripped.startswith("{"):
+        lines = [ln for ln in text.splitlines() if not ln.lstrip().startswith("//")]
+        text = "\n".join(lines)
+        m = JS_WRAPPER.search(text)
+        if not m:
+            raise SystemExit("%s: not JSON and not a recognised bundle.js wrapper" % path)
+        text = text[m.end():].strip().rstrip(";")
+    return json.loads(text)
+
+
+def load_store(directory):
+    """The authored half (§5). Every file is optional; absence is not an error."""
+    store = {"tags": [], "groups": [], "chunks": [], "adjudications": {}, "notes": {}}
+    if not directory or not os.path.isdir(directory):
+        return store
+
+    def read(name):
+        p = os.path.join(directory, name)
+        if not os.path.exists(p):
+            return None
+        with open(p, "r", encoding="utf-8") as fh:
+            return json.load(fh)
+
+    tags = read("tags.json") or {}
+    store["tags"] = tags.get("tags", []) if isinstance(tags, dict) else tags
+    groups = read("equivalences.json") or {}
+    store["groups"] = groups.get("groups", []) if isinstance(groups, dict) else groups
+    chunks = read("chunks.json") or {}
+    store["chunks"] = chunks.get("chunks", []) if isinstance(chunks, dict) else chunks
+    adj = read("adjudications.json") or {}
+    store["adjudications"] = {k: v for k, v in adj.items() if not k.startswith("_")}
+
+    notes_dir = os.path.join(directory, "notes")
+    if os.path.isdir(notes_dir):
+        for name in sorted(os.listdir(notes_dir)):
+            if not name.endswith(".json"):
+                continue
+            with open(os.path.join(notes_dir, name), "r", encoding="utf-8") as fh:
+                store["notes"][name[:-5]] = json.load(fh)
+    return store
+
+
+def dump_json(obj, path):
+    """Deterministic serialization, so a diff shows the judgement that changed."""
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(obj, fh, indent=2, sort_keys=True, ensure_ascii=False)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def canonical_manifest_hash(groups):
+    """Membership-only, id-independent (§5). Answers 'did this change any curated
+    meaning?' with one comparison, and survives renumbering."""
+    import hashlib
+
+    rows = sorted(sorted(g.get("members", [])) for g in groups)
+    blob = json.dumps(rows, separators=(",", ":"), sort_keys=True).encode()
+    return "sha256:" + hashlib.sha256(blob).hexdigest()
+
+
+# ------------------------------------------------------------------ indexing helpers
+
+
+def variants_of(bundle):
+    return sorted(bundle.get("variants", []), key=lambda v: (v.get("order", 0), v.get("id", "")))
+
+
+def containers_by_variant(bundle):
+    out = defaultdict(list)
+    for c in bundle.get("containers", []):
+        out[c.get("variant")].append(c)
+    for v in out:
+        out[v].sort(key=lambda c: (parse_addr(c.get("start")) or 0, c.get("name") or ""))
+    return out
+
+
+def resolve(bundle, table, value):
+    """Internable fields (§4) hold either a literal string or an integer index into
+    bundle['strings'][table]. One resolver, used everywhere such a field is read."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return value
+    arr = (bundle.get("strings") or {}).get(table) or []
+    return arr[value] if 0 <= value < len(arr) else None
+
+
+def frame_file(bundle, frame):
+    return resolve(bundle, "file", frame.get("file"))
+
+
+def row_text(bundle, row):
+    return resolve(bundle, "text", row.get("text"))
+
+
+def auto_link_scope(bundle):
+    corp = bundle.get("corpus", {})
+    scope = (corp.get("correspondence") or {}).get("autoLink")
+    return list(scope) if scope else ["variant", "unit", "file", "line"]
+
+
+# ------------------------------------------------------------------- check (§4, §5)
+
+
+class Report:
+    def __init__(self):
+        self.errors = []
+        self.warnings = []
+
+    def error(self, msg):
+        self.errors.append(msg)
+
+    def warn(self, msg):
+        self.warnings.append(msg)
+
+    def finish(self, label):
+        for w in self.warnings:
+            print("warn:  %s" % w)
+        for e in self.errors:
+            print("ERROR: %s" % e)
+        if self.errors:
+            print("\n%s: %d error(s), %d warning(s)" % (label, len(self.errors), len(self.warnings)))
+            return 1
+        print("%s: ok (%d warning(s))" % (label, len(self.warnings)))
+        return 0
+
+
+def check_bundle(bundle, store, rep):
+    corp = bundle.get("corpus", {})
+    if bundle.get("schema") != SCHEMA:
+        rep.error("bundle schema is %r, expected %d" % (bundle.get("schema"), SCHEMA))
+    if bundle.get("kind") != "asm-analysis/bundle":
+        rep.error("bundle kind is %r" % bundle.get("kind"))
+    if not corp.get("contract"):
+        rep.error("corpus.contract is missing -- state what is in scope and what is not")
+    if corp.get("relevance") not in ("overlay", "cited", "declared", None):
+        rep.error("corpus.relevance is %r" % corp.get("relevance"))
+
+    variants = variants_of(bundle)
+    ids = [v.get("id") for v in variants]
+    if len(set(ids)) != len(ids):
+        rep.error("duplicate variant ids: %r" % [i for i in ids if ids.count(i) > 1])
+    declared = corp.get("variantCount")
+    if declared is None:
+        rep.error("corpus.variantCount is missing -- a truncated bundle must fail loudly")
+    elif declared != len(variants):
+        rep.error("corpus.variantCount is %r but the bundle carries %d" % (declared, len(variants)))
+
+    artifact = {}
+    for v in variants:
+        if not v.get("artifactHash"):
+            rep.error("variant %r has no artifactHash" % v.get("id"))
+        artifact[v.get("id")] = v.get("artifactHash")
+        if not v.get("sourceRev"):
+            rep.warn("variant %r has no sourceRev" % v.get("id"))
+
+    # units: every unit appears in every variant, possibly not-applicable (§4)
+    for u in bundle.get("units", []):
+        real = u.get("realizations", {})
+        for vid in ids:
+            if vid not in real:
+                rep.error("unit %r has no realization for variant %r" % (u.get("id"), vid))
+            elif real[vid].get("status") not in (
+                "present", "inlined-away", "absent", "not-applicable"
+            ):
+                rep.error(
+                    "unit %r variant %r has status %r" % (u.get("id"), vid, real[vid].get("status"))
+                )
+
+    sources = bundle.get("sources", {})
+    scope = auto_link_scope(bundle)
+    if any(c not in ("variant", "unit", "file", "line") for c in scope):
+        rep.error("corpus.correspondence.autoLink has an unknown component: %r" % scope)
+
+    seen_high = set()
+    seen_low = set()
+    for vid in ids:
+        spans = []
+        for c in containers_by_variant(bundle).get(vid, []):
+            check_container(bundle, c, vid, artifact.get(vid), sources, rep, seen_high, seen_low)
+            lo, hi = parse_addr(c.get("start")), parse_addr(c.get("stop"))
+            if lo is not None and hi is not None:
+                spans.append((lo, hi, c.get("name")))
+        spans.sort()
+        for (a_lo, a_hi, a_name), (b_lo, b_hi, b_name) in zip(spans, spans[1:]):
+            if b_lo < a_hi and not (a_lo == b_lo and a_hi == b_hi):
+                rep.error(
+                    "variant %r: containers %r and %r overlap without being exact aliases"
+                    % (vid, a_name, b_name)
+                )
+
+    check_overlay(bundle, rep)
+    check_store(bundle, store, rep, seen_high, seen_low, artifact)
+    return seen_high, seen_low
+
+
+def check_container(bundle, c, vid, artifact, sources, rep, seen_high, seen_low):
+    name = c.get("name") or c.get("id")
+    where = "variant %r container %r" % (vid, name)
+    rows = c.get("rows") or []
+    if not rows:
+        rep.error("%s: no decoded rows" % where)
+        return
+    start, stop = parse_addr(c.get("start")), parse_addr(c.get("stop"))
+
+    prev = None
+    for i, r in enumerate(rows):
+        addr = parse_addr(r.get("address"))
+        if addr is None:
+            rep.error("%s: row %d has unparseable address %r" % (where, i, r.get("address")))
+            continue
+        if prev is not None and addr <= prev:
+            rep.error("%s: addresses are not strictly monotonic at row %d" % (where, i))
+        prev = addr
+        key = r.get("key")
+        if key:
+            space, fields = parse_key(key)
+            if space != "lo":
+                rep.error("%s: row %d key is not a low-row key (%s)" % (where, i, fields))
+            else:
+                if fields["variant"] != vid:
+                    rep.error("%s: row %d key names variant %r" % (where, i, fields["variant"]))
+                if artifact and fields["artifact"] != artifact:
+                    rep.error("%s: row %d key carries a different artifact hash" % (where, i))
+                if fields["address"] != norm_addr(r.get("address")):
+                    rep.error("%s: row %d key address disagrees with the row" % (where, i))
+                if key in seen_low:
+                    rep.error("%s: row %d key is not unique" % (where, i))
+                seen_low.add(key)
+        if start is not None and r.get("offset") is not None and addr - start != r["offset"]:
+            rep.error(
+                "%s: row %d offset %r does not match address - container start"
+                % (where, i, r.get("offset"))
+            )
+        frames = r.get("frames") or []
+        for f in frames:
+            fk = f.get("key")
+            if fk:
+                space, fields = parse_key(fk)
+                if space != "hi":
+                    rep.error("%s: row %d frame key is not a high-row key (%s)" % (where, i, fields))
+                else:
+                    seen_high.add(fk)
+            fpath, fline = frame_file(bundle, f), f.get("line")
+            if isinstance(f.get("file"), int) and fpath is None:
+                rep.error("%s: row %d frame file index %r is out of range"
+                          % (where, i, f.get("file")))
+            if fpath and fline is not None:
+                src = (sources.get(vid) or {}).get(fpath)
+                if src is None:
+                    rep.error("%s: row %d cites %s, which the bundle carries no source for"
+                              % (where, i, fpath))
+                elif src.get("available") and src.get("lineCount") is not None:
+                    if fline > src["lineCount"]:
+                        rep.error(
+                            "%s: row %d cites %s:%d but that file has %d lines -- wrong revision"
+                            % (where, i, fpath, fline, src["lineCount"])
+                        )
+        if frames and not any(f.get("physical") for f in frames):
+            rep.warn("%s: row %d has no frame marked physical" % (where, i))
+
+    # decode covers exactly [start, stop)
+    if start is not None and parse_addr(rows[0].get("address")) != start:
+        rep.error("%s: first row is not at the container start" % where)
+    if stop is not None:
+        last = rows[-1]
+        nbytes = len((last.get("bytes") or "").split())
+        end = parse_addr(last.get("address"))
+        if end is not None and nbytes and end + nbytes != stop:
+            rep.error(
+                "%s: decode ends at %s but the container stops at %s"
+                % (where, hex(end + nbytes), hex(stop))
+            )
+    if c.get("instructionCount") not in (None, len(rows)):
+        rep.error("%s: instructionCount is %r but %d rows are present"
+                  % (where, c.get("instructionCount"), len(rows)))
+
+    for unit, occs in (c.get("unitOccurrences") or {}).items():
+        for o in occs:
+            if not (0 <= o.get("startIndex", -1) <= o.get("stopIndex", -1) < len(rows)):
+                rep.error("%s: unit %r has an out-of-range occurrence %r" % (where, unit, o))
+
+
+def check_overlay(bundle, rep):
+    overlay = bundle.get("overlay")
+    if not overlay:
+        return
+    by_variant = containers_by_variant(bundle)
+    for vid, report in (overlay.get("reports") or {}).items():
+        declared = report.get("artifactHash")
+        variant = next((v for v in bundle.get("variants", []) if v.get("id") == vid), None)
+        if variant and declared and declared != variant.get("artifactHash"):
+            rep.error("overlay for %r measures a different build than the bundle decodes" % vid)
+        decoded = {}
+        for c in by_variant.get(vid, []):
+            for r in c.get("rows") or []:
+                decoded[norm_addr(r.get("address"))] = (r.get("bytes") or "").lower()
+        measured = {norm_addr(i.get("address")): (i.get("bytes") or "").lower()
+                    for i in report.get("instructions") or []}
+        # Set equality, not containment: a subset check passes on a partial overlay.
+        missing = set(measured) - set(decoded)
+        if missing:
+            rep.error("overlay for %r measures %d address(es) outside the decoded space"
+                      % (vid, len(missing)))
+        for addr, mb in measured.items():
+            db = decoded.get(addr)
+            if db and mb and db != mb:
+                rep.error("overlay for %r disagrees with the decode at %s (bytes, not text)"
+                          % (vid, addr))
+
+
+def check_store(bundle, store, rep, seen_high, seen_low, artifact):
+    claimed = {}
+    for g in store["groups"]:
+        members = g.get("members") or []
+        if len(members) < 2:
+            rep.error("equivalence group %r has %d member(s)" % (g.get("id"), len(members)))
+        if not g.get("note"):
+            rep.error("equivalence group %r has no note" % g.get("id"))
+        for m in members:
+            if m not in seen_high:
+                rep.error("equivalence group %r cites %s, which no row carries -- rotted"
+                          % (g.get("id"), m))
+            if m in claimed and claimed[m] != g.get("id"):
+                rep.error("high row %s is claimed by both %r and %r"
+                          % (m, claimed[m], g.get("id")))
+            claimed[m] = g.get("id")
+
+    tag_ids = set()
+    texts = []
+    for c in bundle.get("containers", []):
+        for r in c.get("rows") or []:
+            texts.append(row_text(bundle, r) or "")
+    for t in store["tags"]:
+        tid = t.get("id")
+        if tid in tag_ids:
+            rep.error("duplicate tag id %r" % tid)
+        tag_ids.add(tid)
+        if t.get("kind") not in ("instruction", "source", "component", None):
+            rep.error("tag %r has kind %r" % (tid, t.get("kind")))
+        match = t.get("match") or {}
+        if match.get("text"):
+            try:
+                pat = re.compile(match["text"])
+            except re.error as exc:
+                rep.error("tag %r has an invalid match regex: %s" % (tid, exc))
+                continue
+            if not any(pat.search(txt) for txt in texts):
+                # An instruction rule that selects nothing has rotted. A component tag
+                # legitimately matches zero rows (§6).
+                if t.get("kind") == "component":
+                    rep.warn("component tag %r matches no row" % tid)
+                else:
+                    rep.error("tag %r matches no row -- the rule has rotted" % tid)
+
+    for name, nf in store["notes"].items():
+        vid = nf.get("variant")
+        declared = nf.get("artifactHash")
+        if vid and vid not in artifact:
+            rep.error("notes/%s names unknown variant %r" % (name, vid))
+        elif declared and artifact.get(vid) and declared != artifact[vid]:
+            rep.error(
+                "notes/%s was written against %s but the bundle carries %s -- re-anchor the "
+                "notes rather than editing the hash" % (name, declared[:19], artifact[vid][:19])
+            )
+        addrs = {}
+        for c in bundle.get("containers", []):
+            if c.get("variant") != vid:
+                continue
+            for r in c.get("rows") or []:
+                addrs[norm_addr(r.get("address"))] = r
+        for addr, note in (nf.get("notes") or {}).items():
+            row = addrs.get(norm_addr(addr))
+            if row is None:
+                rep.error("notes/%s: %s is not an instruction in this bundle" % (name, addr))
+                continue
+            body = note.get("body") if isinstance(note, dict) else note
+            if not (body or "").strip():
+                rep.error("notes/%s: %s has an empty body" % (name, addr))
+            if isinstance(note, dict):
+                if note.get("confidence") not in ("high", "medium"):
+                    rep.error("notes/%s: %s has confidence %r -- use an omission instead"
+                              % (name, addr, note.get("confidence")))
+                for field in ("container", "offset", "bytes"):
+                    if note.get(field) in (None, ""):
+                        rep.error("notes/%s: %s has no %s -- it cannot be re-anchored"
+                                  % (name, addr, field))
+                if note.get("bytes") and row.get("bytes") and \
+                        note["bytes"].lower() != row["bytes"].lower():
+                    rep.error("notes/%s: %s bytes disagree with the decode" % (name, addr))
+        overlap = set(nf.get("notes") or {}) & set(nf.get("omissions") or {})
+        if overlap:
+            rep.error("notes/%s: %d address(es) both noted and omitted" % (name, len(overlap)))
+
+
+def cmd_check(args):
+    bundle = load_bundle(args.bundle)
+    store = load_store(args.annotations)
+    rep = Report()
+    check_bundle(bundle, store, rep)
+    if store["groups"]:
+        print("equivalence manifest %s" % canonical_manifest_hash(store["groups"]))
+    return rep.finish(os.path.basename(args.bundle))
+
+
+# -------------------------------------------------------------------------- stats
+
+
+def cmd_stats(args):
+    bundle = load_bundle(args.bundle)
+    store = load_store(args.annotations)
+    by_variant = containers_by_variant(bundle)
+    noted = defaultdict(set)
+    omitted = defaultdict(set)
+    for nf in store["notes"].values():
+        noted[nf.get("variant")].update(norm_addr(a) for a in (nf.get("notes") or {}))
+        omitted[nf.get("variant")].update(norm_addr(a) for a in (nf.get("omissions") or {}))
+
+    print("corpus: %s" % (bundle.get("corpus", {}).get("title") or bundle.get("corpus", {}).get("id")))
+    print("contract: %s" % bundle.get("corpus", {}).get("contract", "-"))
+    print("auto-link scope: %s" % "+".join(auto_link_scope(bundle)))
+    print()
+    head = "%-22s %7s %7s %7s %7s %7s" % ("variant", "cont", "rows", "cited", "noted", "omit")
+    print(head)
+    print("-" * len(head))
+    for v in variants_of(bundle):
+        vid = v["id"]
+        conts = by_variant.get(vid, [])
+        rows = [r for c in conts for r in (c.get("rows") or [])]
+        cited = set()
+        for r in rows:
+            for f in r.get("frames") or []:
+                fp = frame_file(bundle, f)
+                if fp and f.get("line") is not None:
+                    cited.add((fp, f["line"]))
+        print("%-22s %7d %7d %7d %7d %7d" % (
+            vid, len(conts), len(rows), len(cited),
+            len(noted.get(vid, ())), len(omitted.get(vid, ()))))
+
+    counters = defaultdict(int)
+    for u in bundle.get("units", []):
+        for vid, real in (u.get("realizations") or {}).items():
+            for k, n in (real.get("qualityCounters") or {}).items():
+                counters[k] += n if isinstance(n, int) else 0
+    if counters:
+        print("\nmapping quality (summed over units)")
+        for k in sorted(counters):
+            print("  %-34s %d" % (k, counters[k]))
+
+    if store["groups"]:
+        sizes = defaultdict(int)
+        for g in store["groups"]:
+            sizes[len(g.get("members", []))] += 1
+        print("\nequivalence groups: %d (%s)" % (
+            len(store["groups"]),
+            ", ".join("%d x%d" % (n, sizes[n]) for n in sorted(sizes))))
+        print("manifest %s" % canonical_manifest_hash(store["groups"]))
+    return 0
+
+
+# ------------------------------------------------------------------- chunks (§8)
+
+
+def cmd_chunks(args):
+    """Propose a partition. Every row carrying a reviewed attribution lands in exactly
+    one chunk; chunks may span non-contiguous ranges."""
+    bundle = load_bundle(args.bundle)
+    store = load_store(args.annotations)
+    by_variant = containers_by_variant(bundle)
+
+    def bucket_of(row, container):
+        if args.by == "container":
+            return container.get("name") or container.get("id")
+        if args.by == "file":
+            for f in row.get("frames") or []:
+                fp = frame_file(bundle, f)
+                if fp:
+                    return fp
+            return "<no-file>"
+        # A principal unit owns the helpers inlined into it, so a row is owned by its
+        # outermost (physical) frame's unit. A helper that was NOT inlined is its own
+        # physical frame, so it owns its own rows -- one rule covers both cases.
+        frames = row.get("frames") or []
+        phys = next((f for f in reversed(frames) if f.get("physical")), None) or \
+            (frames[-1] if frames else None)
+        if phys and phys.get("key"):
+            space, fields = parse_key(phys["key"])
+            if space == "hi" and fields.get("unit") not in (None, "-"):
+                return fields["unit"]
+        units = row.get("units") or []
+        return units[-1] if units else (container.get("chapter") or "<unattributed>")
+
+    proposed = []
+    for v in variants_of(bundle):
+        vid = v["id"]
+        buckets = defaultdict(list)
+        for c in by_variant.get(vid, []):
+            for r in c.get("rows") or []:
+                buckets[bucket_of(r, c)].append((c, r))
+        for name in sorted(buckets):
+            rows = buckets[name]
+            nsplit = max(1, -(-len(rows) // args.size))
+            per = -(-len(rows) // nsplit)
+            for i in range(nsplit):
+                part = rows[i * per:(i + 1) * per]
+                if not part:
+                    continue
+                suffix = "" if nsplit == 1 else ".s%02d" % (i + 1)
+                proposed.append({
+                    "id": "%s__%s%s" % (vid, re.sub(r"[^\w.-]+", "-", str(name)), suffix),
+                    "title": "%s in %s" % (name, vid),
+                    "variant": vid,
+                    "axis": args.by,
+                    "member": name,
+                    "artifactHash": v.get("artifactHash"),
+                    "ownedAddresses": [norm_addr(r.get("address")) for _, r in part],
+                    "containers": sorted({c.get("name") or c.get("id") for c, _ in part}),
+                    "state": "ready",
+                    "assignee": None,
+                    "phase": None,
+                    "dependsOn": [],
+                })
+
+    existing = {c.get("id") for c in store["chunks"]}
+    if args.write:
+        merged = list(store["chunks"]) + [c for c in proposed if c["id"] not in existing]
+        dump_json({"schema": SCHEMA, "axis": args.by, "chunks": merged},
+                  os.path.join(args.annotations, "chunks.json"))
+        print("wrote %d chunk(s) (%d new) to %s/chunks.json"
+              % (len(merged), len(merged) - len(store["chunks"]), args.annotations))
+        return 0
+
+    total = sum(len(c["ownedAddresses"]) for c in proposed)
+    print("%d chunk(s) over %d row(s), by %s%s\n"
+          % (len(proposed), total, args.by, "" if not existing else " (* already in the store)"))
+    print("%-46s %7s  %s" % ("chunk", "rows", "state"))
+    for c in proposed:
+        mark = "*" if c["id"] in existing else " "
+        print("%s%-45s %7d  %s" % (mark, c["id"], len(c["ownedAddresses"]), c["state"]))
+    print("\nre-run with --write to merge these into %s/chunks.json" % args.annotations)
+    return 0
+
+
+# --------------------------------------------------------------------- serve (§7)
+
+
+def cmd_serve(args):
+    bundle_path = os.path.abspath(args.bundle)
+    ann_dir = os.path.abspath(args.annotations) if args.annotations else None
+    bundle = load_bundle(bundle_path)
+    rep = Report()
+    check_bundle(bundle, load_store(ann_dir), rep)
+    if rep.errors:
+        print("refusing to serve an invalid bundle:\n")
+        rep.finish(os.path.basename(bundle_path))
+        return 1
+
+    def store_state():
+        store = load_store(ann_dir)
+        notes, line_tags = {}, defaultdict(list)
+        artifact = {v["id"]: v.get("artifactHash") for v in bundle.get("variants", [])}
+        for nf in store["notes"].values():
+            vid = nf.get("variant")
+            for addr, note in (nf.get("notes") or {}).items():
+                body = note.get("body") if isinstance(note, dict) else note
+                notes[low_key("asm", vid, artifact.get(vid), addr)] = body
+            for addr, tids in (nf.get("lineTags") or {}).items():
+                line_tags[low_key("asm", vid, artifact.get(vid), addr)] = tids
+        return {
+            "tags": store["tags"],
+            "notes": notes,
+            "lineTags": dict(line_tags),
+            "equivalences": [g.get("members", []) for g in store["groups"]],
+            "chunks": store["chunks"],
+            "manifest": canonical_manifest_hash(store["groups"]),
+            "writable": bool(ann_dir),
+        }
+
+    def write_note(key, body):
+        """Writes land in the chunk that owns the address, else an 'unassigned' file.
+        Never writes on read (§5) -- only this path writes."""
+        if not ann_dir:
+            return False, "no annotation directory"
+        space, fields = parse_key(key)
+        if space != "lo":
+            return False, "not a low-row key"
+        vid, addr = fields["variant"], fields["address"]
+        store = load_store(ann_dir)
+        chunk = "unassigned"
+        for c in store["chunks"]:
+            if c.get("variant") == vid and addr in {norm_addr(a) for a in c.get("ownedAddresses", [])}:
+                chunk = c.get("id", chunk)
+                break
+        row = None
+        for c in bundle.get("containers", []):
+            if c.get("variant") != vid:
+                continue
+            for r in c.get("rows") or []:
+                if norm_addr(r.get("address")) == addr:
+                    row, owner = r, c
+                    break
+        name = "%s.%s" % (chunk, vid)
+        path = os.path.join(ann_dir, "notes", name + ".json")
+        nf = store["notes"].get(name) or {
+            "schema": SCHEMA, "chunk": chunk, "variant": vid,
+            "artifactHash": fields["artifact"], "notes": {}, "omissions": {},
+        }
+        if (body or "").strip():
+            record = {"body": body, "confidence": "medium"}
+            if row is not None:
+                record.update({
+                    "container": owner.get("name") or owner.get("id"),
+                    "offset": row.get("offset"),
+                    "bytes": row.get("bytes"),
+                })
+            nf.setdefault("notes", {})[addr] = record
+        else:
+            nf.setdefault("notes", {}).pop(addr, None)
+        dump_json(nf, path)
+        return True, None
+
+    def write_equivalence(members):
+        if not ann_dir:
+            return False, "no annotation directory"
+        members = sorted(set(members))
+        if len(members) < 2:
+            return False, "a group needs at least two members"
+        store = load_store(ann_dir)
+        groups = [g for g in store["groups"]
+                  if not (set(g.get("members", [])) & set(members))]
+        # Selecting a member of an established group merges that group's complete
+        # transitive membership (§5).
+        for g in store["groups"]:
+            if set(g.get("members", [])) & set(members):
+                members = sorted(set(members) | set(g.get("members", [])))
+        groups.append({"id": "g%d" % (len(groups) + 1), "note": "", "members": members})
+        dump_json({"schema": SCHEMA, "groups": groups},
+                  os.path.join(ann_dir, "equivalences.json"))
+        return True, None
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        protocol_version = "HTTP/1.1"
+
+        def log_message(self, fmt, *a):
+            if args.verbose:
+                sys.stderr.write("%s - %s\n" % (self.address_string(), fmt % a))
+
+        def _send(self, body, ctype, status=200):
+            if isinstance(body, str):
+                body = body.encode("utf-8")
+            enc = None
+            if len(body) > 1024 and "gzip" in (self.headers.get("Accept-Encoding") or ""):
+                buf = io.BytesIO()
+                with gzip.GzipFile(fileobj=buf, mode="wb", mtime=0) as gz:
+                    gz.write(body)
+                body, enc = buf.getvalue(), "gzip"
+            self.send_response(status)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            if enc:
+                self.send_header("Content-Encoding", enc)
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            path = urllib.parse.urlparse(self.path).path
+            if path in ("/", "/index.html"):
+                return self._send(VIEWER_HTML, "text/html; charset=utf-8")
+            if path == "/bundle.json":
+                return self._send(json.dumps(bundle, sort_keys=True), "application/json")
+            if path == "/api/state":
+                return self._send(json.dumps(store_state(), sort_keys=True), "application/json")
+            self._send("not found", "text/plain", 404)
+
+        def do_POST(self):
+            path = urllib.parse.urlparse(self.path).path
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                payload = json.loads(self.rfile.read(length) or b"{}")
+            except ValueError:
+                return self._send(json.dumps({"ok": False, "error": "bad json"}),
+                                  "application/json", 400)
+            if path == "/api/note":
+                ok, err = write_note(payload.get("key"), payload.get("body", ""))
+            elif path == "/api/equivalence":
+                ok, err = write_equivalence(payload.get("members") or [])
+            else:
+                ok, err = False, "unknown endpoint"
+            body = {"ok": ok, "error": err}
+            if ok:
+                body["state"] = store_state()
+            self._send(json.dumps(body, sort_keys=True), "application/json", 200 if ok else 400)
+
+    class Server(socketserver.ThreadingTCPServer):
+        allow_reuse_address = True
+        daemon_threads = True
+
+    with Server(("127.0.0.1", args.port), Handler) as httpd:
+        print("asmviz serving %s on http://127.0.0.1:%d/" % (os.path.basename(bundle_path), args.port))
+        print("annotations: %s" % (ann_dir or "(read-only: no --annotations given)"))
+        try:
+            httpd.serve_forever()
+        except KeyboardInterrupt:
+            print()
+    return 0
+
+
+# ---------------------------------------------------------------------- the viewer
+#
+# A reference consumer of the format, implementing SKILL.md §7. Everything it knows
+# about the corpus it reads from the bundle: there is no variant name, no cohort
+# count, and no language anywhere in this document.
+
+VIEWER_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>asm-analysis workspace</title>
+<style>
+:root {
+  --bg:#f7f7f8; --panel:#fff; --ink:#1b1c1e; --muted:#6b7076; --line:#d8dade;
+  --linked:#2f7fd6; --pinned:#d2860f; --stack:#8257d6; --group:#12996b;
+  --warning:#b8860b; --danger:#d1483c;
+  --row-height:22px; --rail:11px; --column-min:340px;
+  color-scheme: light dark;
+}
+:root[data-theme="dark"], :root:not([data-theme="light"]) {
+  --bg:#141518; --panel:#1b1d21; --ink:#e6e7ea; --muted:#9aa0a8; --line:#2c2f35;
+  --linked:#4a9eff; --pinned:#f0a63c; --stack:#a077f0; --group:#35c08b;
+  --warning:#f5c96b; --danger:#ff8066;
+}
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg:#f7f7f8; --panel:#fff; --ink:#1b1c1e; --muted:#6b7076; --line:#d8dade;
+    --linked:#2f7fd6; --pinned:#d2860f; --stack:#8257d6; --group:#12996b;
+    --warning:#b8860b; --danger:#d1483c;
+  }
+}
+* { box-sizing:border-box; }
+body { margin:0; background:var(--bg); color:var(--ink);
+  font:13px/1.45 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace; }
+#bar { display:flex; gap:10px; align-items:center; flex-wrap:wrap;
+  padding:6px 10px; border-bottom:1px solid var(--line); background:var(--panel); }
+#bar button, #bar select { font:inherit; color:inherit; background:transparent;
+  border:1px solid var(--line); border-radius:4px; padding:2px 7px; cursor:pointer; }
+#bar button[aria-pressed="true"] { border-color:var(--linked); color:var(--linked); }
+#status { color:var(--muted); margin-left:auto; }
+/* Layout law: ONE grid owns every panel, 2 rows x N columns. Panels never scroll
+   horizontally; the workspace does. */
+#scroller { overflow-x:auto; overflow-y:hidden; height:calc(100vh - 40px); }
+#grid {
+  display:grid;
+  grid-template-columns:repeat(var(--column-count), minmax(var(--column-min), 1fr));
+  grid-template-rows:26px minmax(0,44fr) 26px minmax(0,56fr);
+  min-width:calc(var(--column-count) * var(--column-min));
+  height:100%; gap:1px; background:var(--line);
+}
+.host { display:contents; }
+.band { grid-column:1 / -1; background:var(--panel); color:var(--muted);
+  padding:4px 10px; font-size:11px; letter-spacing:.08em; text-transform:uppercase; }
+.band.hi { grid-row:1; } .band.lo { grid-row:3; }
+.panel { background:var(--panel); display:flex; flex-direction:column; min-width:0;
+  contain:layout paint size; position:relative; }
+.panel.hi { grid-row:2; } .panel.lo { grid-row:4; }
+.head { display:flex; gap:8px; align-items:baseline; padding:3px 8px;
+  border-bottom:1px solid var(--line); font-size:11px; color:var(--muted);
+  white-space:nowrap; overflow:hidden; }
+.head b { color:var(--ink); font-weight:600; }
+.body { flex:1; overflow-y:auto; overflow-x:hidden; position:relative;
+  padding-right:var(--rail); }
+.rail { position:absolute; top:0; right:0; bottom:0; width:var(--rail);
+  background:transparent; cursor:pointer; }
+.rail-mark { position:absolute; height:2px; border-radius:1px; }
+.rail-mark.c { left:1px; width:4px; }
+.rail-mark.t { right:1px; width:4px; }
+/* rows */
+.row { display:grid; height:var(--row-height); align-items:center;
+  white-space:pre; overflow:hidden; border-left:3px solid transparent;
+  padding-right:4px; }
+.hi .row { grid-template-columns:52px 1fr; }
+.lo .row { grid-template-columns:7px 64px 1fr; }
+.row.context { opacity:.42; }
+.row:hover { background:color-mix(in oklab, var(--linked) 8%, transparent); }
+.n { color:var(--muted); text-align:right; padding-right:8px; font-size:11px; }
+.gut { height:100%; }
+.marker { height:var(--row-height); display:flex; align-items:center; gap:6px;
+  padding:0 8px; font-size:11px; color:var(--muted); white-space:pre; overflow:hidden;
+  background:color-mix(in oklab, var(--ink) 4%, transparent); }
+.filehdr { position:sticky; top:0; z-index:2; background:var(--panel);
+  border-bottom:1px solid var(--line); padding:2px 8px; font-size:11px;
+  color:var(--muted); height:var(--row-height); display:flex; gap:8px;
+  align-items:center; }
+.dot { width:6px; height:6px; border-radius:50%; display:inline-block; }
+/* Correspondence channels beat context dimming and the tag tint. Dimming must
+   never suppress a match. */
+.row.stack  { background:color-mix(in oklab, var(--stack) 20%, transparent) !important;
+              border-left-color:var(--stack) !important; opacity:1 !important; }
+.row.group  { background:color-mix(in oklab, var(--group) 18%, transparent) !important;
+              border-left-color:var(--group) !important; opacity:1 !important; }
+.row.link   { background:color-mix(in oklab, var(--linked) 22%, transparent) !important;
+              border-left-color:var(--linked) !important; opacity:1 !important; }
+.row.pin    { background:color-mix(in oklab, var(--pinned) 26%, transparent) !important;
+              border-left-color:var(--pinned) !important; opacity:1 !important; }
+.row.partner { border-left-style:dotted !important; }
+.row.tagged { background:color-mix(in oklab, var(--tag-color,var(--muted)) 16%, transparent); }
+.row.noted .txt::after { content:" \25cf"; color:var(--warning); }
+.tok { color:oklch(var(--tl,.83) var(--tc,.13) var(--th,0)); }
+.empty { padding:14px 10px; color:var(--muted); font-style:italic; }
+dialog { background:var(--panel); color:var(--ink); border:1px solid var(--line);
+  border-radius:8px; max-width:min(680px,92vw); }
+dialog::backdrop { background:rgba(0,0,0,.45); }
+#note { width:100%; min-height:120px; font:inherit; background:var(--bg);
+  color:var(--ink); border:1px solid var(--line); border-radius:4px; padding:6px; }
+@media (max-width:700px) { :root { --column-min:280px; } }
+</style>
+</head>
+<body>
+<div id="bar">
+  <button id="prev" title="previous unit">&#8593;</button>
+  <button id="next" title="next unit">&#8595;</button>
+  <select id="unit" title="unit"></select>
+  <button id="clear" title="clear pins (Esc)">&#215;</button>
+  <button id="tagbtn" aria-pressed="false" title="tag filter (T)">&#9672;</button>
+  <button id="theme" title="theme">&#9728;</button>
+  <span id="status">loading&#8230;</span>
+</div>
+<div id="scroller"><div id="grid"></div></div>
+<dialog id="notedlg">
+  <form method="dialog">
+    <p id="noteaddr" style="color:var(--muted);margin:0 0 6px"></p>
+    <textarea id="note" placeholder="What does this row do, in the source's vocabulary?"></textarea>
+    <menu style="display:flex;gap:8px;justify-content:flex-end;padding:8px 0 0;margin:0">
+      <button value="cancel">cancel</button>
+      <button id="notesave" value="save">save</button>
+    </menu>
+  </form>
+</dialog>
+<dialog id="tagdlg"><div id="taglist" style="padding:4px"></div>
+  <menu style="display:flex;justify-content:flex-end;padding:8px 0 0;margin:0">
+    <form method="dialog"><button>close</button></form></menu>
+</dialog>
+<script>
+"use strict";
+(() => {
+const $ = (s, r = document) => r.querySelector(s);
+const el = (tag, cls, txt) => { const n = document.createElement(tag);
+  if (cls) n.className = cls; if (txt != null) n.textContent = txt; return n; };
+
+let B = null, S = null, scope = [], panels = [], units = [], unitIndex = 0;
+const sel = { hover: null, pins: [], tags: new Set() };
+let lastSignature = "";
+
+// ---- keys. Parsed here and nowhere else (SKILL.md §3).
+const dec = s => decodeURIComponent(s);
+function parseKey(k) {
+  if (typeof k !== "string") return null;
+  const p = k.split("|");
+  if (p.length !== 6 || p[1] !== "1") return null;
+  if (p[0] === "hi") return { space:"hi", variant:dec(p[2]), unit:dec(p[3]), file:dec(p[4]), line:dec(p[5]) };
+  if (p[0] === "lo") return { space:"lo", kind:dec(p[2]), variant:dec(p[3]), artifact:dec(p[4]), address:dec(p[5]) };
+  if (p[0] === "ct") return { space:"ct", variant:dec(p[2]), artifact:dec(p[3]) };
+  return null;
+}
+const enc = s => (s == null ? "-" : String(s).replace(/%/g, "%25").replace(/\|/g, "%7C") || "-");
+// Internable fields (SKILL.md §4) hold a literal string or an index into B.strings.
+const str = (table, v) => (typeof v === "number"
+  ? (((B.strings || {})[table] || [])[v] ?? null) : v);
+const frameFile = f => str("file", f.file);
+const frameFn = f => f.displayFunction || str("function", f.function);
+const rowText = r => str("text", r.text) || "";
+const highKey = (v, u, f, l) => ["hi","1",enc(v),enc(u),enc(f),enc(l)].join("|");
+function project(key) {
+  const f = parseKey(key); if (!f || f.space !== "hi") return null;
+  return scope.map(c => enc(f[c])).join("|");
+}
+
+// ---- token families. Coloured only when the bundle declares them: a fixed table,
+// never encounter order, so a token keeps its colour across panels and rebuilds.
+let FAM = null;
+function buildFamilies() {
+  const tf = (B.corpus && B.corpus.tokenFamilies) || null;
+  if (!tf || !tf.order || !tf.order.length) return null;
+  const order = tf.order, aliases = tf.aliases || {}, classes = tf.classes || {};
+  const CH = { gpr:.155, mask:.105, vec:.13, addr:.07, other:.12 };
+  const n = order.length;
+  // Over a known, small set divide the circle evenly on a stride coprime with n;
+  // the golden angle leaves visible collisions at small n.
+  let stride = Math.max(1, Math.round(n * 0.375)) | 1;
+  while (n > 1 && gcd(stride, n) !== 1) stride++;
+  const hue = {}; order.forEach((name, i) => { hue[name] = (i * stride * (360 / n)) % 360; });
+  const re = new RegExp("\\b(" + Object.keys(aliases).concat(order)
+    .sort((a, b) => b.length - a.length).map(esc).join("|") + ")\\b", "g");
+  return { re, canon: t => aliases[t] || t, hue, chroma: t => CH[classes[t] || "other"] || CH.other };
+}
+const gcd = (a, b) => b ? gcd(b, a % b) : a;
+const esc = s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+function renderText(text) {
+  const span = el("span", "txt");
+  if (!FAM) { span.textContent = text; return span; }
+  let last = 0; FAM.re.lastIndex = 0; let m;
+  while ((m = FAM.re.exec(text))) {
+    if (m.index > last) span.appendChild(document.createTextNode(text.slice(last, m.index)));
+    const fam = FAM.canon(m[0]);
+    const t = el("span", "tok", m[0]);
+    t.style.setProperty("--th", String(FAM.hue[fam] ?? 0));
+    t.style.setProperty("--tc", String(FAM.chroma(fam)));
+    t.title = m[0] + " · " + fam;
+    span.appendChild(t); last = m.index + m[0].length;
+  }
+  span.appendChild(document.createTextNode(text.slice(last)));
+  return span;
+}
+
+// ---- virtual row model. Markers occupy row slots in the same model as rows, so
+// instruction index != row index. Always translate (SKILL.md §7).
+function rowModel(container) {
+  if (container.__model) return container.__model;
+  const rows = container.rows || [], regions = (container.regions || []).slice()
+    .sort((a, b) => (a.startRow - b.startRow) || (a.level - b.level));
+  const virt = [], instRow = new Map();
+  virt.push({ t: "begin", c: container });
+  let ri = 0;
+  for (let i = 0; i < rows.length; i++) {
+    while (ri < regions.length && regions[ri].startRow === i) virt.push({ t: "region", r: regions[ri++] });
+    instRow.set(i, virt.length);
+    virt.push({ t: "inst", i, row: rows[i] });
+  }
+  virt.push({ t: "end", c: container });
+  container.__model = { virt, instRow };
+  return container.__model;
+}
+
+// ---- indexes: high key -> low rows, low row -> high keys, per panel.
+function buildIndexes(p) {
+  const byHigh = new Map(), byProj = new Map();
+  for (const c of p.containers) {
+    const m = rowModel(c);
+    (c.rows || []).forEach((r, i) => {
+      for (const f of r.frames || []) {
+        if (!f.key) continue;
+        if (!byHigh.has(f.key)) byHigh.set(f.key, []);
+        byHigh.get(f.key).push({ c, i, v: m.instRow.get(i) });
+        const pj = project(f.key);
+        if (pj) { if (!byProj.has(pj)) byProj.set(pj, []); byProj.get(pj).push({ c, i, v: m.instRow.get(i) }); }
+      }
+    });
+  }
+  p.byHigh = byHigh; p.byProj = byProj;
+}
+
+function equivalenceOf(key) {
+  const out = new Set([key]);
+  for (const g of (S.equivalences || [])) if (g.includes(key)) g.forEach(k => out.add(k));
+  return out;
+}
+function expand(keys) {
+  const seeds = new Set(), all = new Set();
+  for (const k of keys) { seeds.add(k); equivalenceOf(k).forEach(x => all.add(x)); }
+  const proj = new Set();
+  for (const k of all) { const p = project(k); if (p) proj.add(p); }
+  return { seeds, all, proj };
+}
+
+// ---- panels
+function build() {
+  const grid = $("#grid");
+  grid.style.setProperty("--column-count", String(B.variants.length));
+  grid.textContent = "";
+  grid.appendChild(Object.assign(el("div", "band hi"), { textContent: "source" }));
+  grid.appendChild(Object.assign(el("div", "band lo"), { textContent: "generated" }));
+
+  const order = B.variants.slice().sort((a, b) => (a.order || 0) - (b.order || 0));
+  panels = order.map(v => {
+    const host = el("div", "host");
+    const hi = el("div", "panel hi"), lo = el("div", "panel lo");
+    const p = { v, hi, lo, containers: (B.containers || []).filter(c => c.variant === v.id) };
+    p.container = pickContainer(p);
+    for (const [node, kind] of [[hi, "hi"], [lo, "lo"]]) {
+      const head = el("div", "head");
+      head.appendChild(el("b", null, v.label || v.id));
+      head.appendChild(el("span", null, kind === "hi"
+        ? (v.sourceRev ? "@" + v.sourceRev : "") + (v.sourceDirty ? " +dirty" : "")
+        : (v.compiler || "")));
+      const count = el("span", "count"); head.appendChild(count);
+      const body = el("div", "body"), rail = el("div", "rail");
+      node.append(head, body, rail);
+      if (kind === "hi") { p.hiBody = body; p.hiRail = rail; p.hiCount = count; }
+      else { p.loBody = body; p.loRail = rail; p.loCount = count; }
+    }
+    host.append(hi, lo); grid.appendChild(host);
+    buildIndexes(p);
+    return p;
+  });
+  panels.forEach(renderHigh);
+  panels.forEach(p => { p.loBody.addEventListener("scroll", () => paintLow(p)); renderLow(p); });
+}
+
+function pickContainer(p) {
+  const withUnit = p.containers.filter(c => Object.keys(c.unitOccurrences || {}).length);
+  const pool = withUnit.length ? withUnit : p.containers;
+  return pool.slice().sort((a, b) =>
+    (b.observedCount || 0) - (a.observedCount || 0) ||
+    (b.rows || []).length - (a.rows || []).length)[0] || null;
+}
+
+// High panels are not virtualized: real measured offsets are needed for the rail
+// because source rows wrap.
+function renderHigh(p) {
+  const body = p.hiBody; body.textContent = "";
+  const files = (B.sources || {})[p.v.id] || {};
+  const names = Object.keys(files).sort();
+  let shown = 0;
+  p.hiRows = new Map();
+  for (const name of names) {
+    const f = files[name];
+    const hdr = el("div", "filehdr");
+    hdr.appendChild(el("b", null, name));
+    if (!f.available) {
+      hdr.appendChild(el("span", null, "source not available"));
+      body.appendChild(hdr); continue;
+    }
+    const lines = f.lines || [];
+    const relevant = new Set(lines.filter(l => l.relevant).map(l => l.n));
+    if (!relevant.size) continue;
+    const ctx = (B.corpus && B.corpus.contextLines) || 3;
+    const keep = new Set();
+    for (const n of relevant) for (let d = -ctx; d <= ctx; d++) keep.add(n + d);
+    hdr.appendChild(el("span", null, relevant.size + " relevant / " + (f.lineCount || lines.length) + " lines"));
+    body.appendChild(hdr);
+    let prev = null;
+    for (const line of lines) {
+      if (!keep.has(line.n)) { prev = null; continue; }
+      if (prev != null && line.n !== prev + 1) body.appendChild(el("div", "marker", "…"));
+      prev = line.n;
+      const row = el("div", "row" + (relevant.has(line.n) ? "" : " context"));
+      row.appendChild(el("div", "n", String(line.n)));
+      row.appendChild(el("div", "src", line.text));
+      const unit = unitFor(p, name, line.n);
+      const key = highKey(p.v.id, unit, name, line.n);
+      row.dataset.key = key;
+      row.addEventListener("pointerenter", () => setHover(key));
+      row.addEventListener("pointerleave", () => setHover(null));
+      row.addEventListener("click", () => togglePin(key));
+      body.appendChild(row);
+      if (!p.hiRows.has(key)) p.hiRows.set(key, []);
+      p.hiRows.get(key).push(row);
+      shown++;
+    }
+  }
+  if (!shown) body.appendChild(el("div", "empty", "no source rows for this variant"));
+  p.hiCount.textContent = shown + " rows";
+}
+
+function unitFor(p, file, line) {
+  for (const u of B.units || []) {
+    const r = (u.realizations || {})[p.v.id];
+    if (r && r.status === "present" && r.file === file &&
+        line >= (r.startLine || 0) && line <= (r.stopLine || 0)) return u.id;
+  }
+  return "-";
+}
+
+// Low panels are virtualized: matches scrolled out of the window have no DOM node,
+// which is why highlighting is written against the model, not the DOM.
+function renderLow(p) {
+  const body = p.loBody; body.textContent = "";
+  if (!p.container) { body.appendChild(el("div", "empty", "no container")); p.loCount.textContent = ""; return; }
+  const m = rowModel(p.container);
+  p.spacer = el("div");
+  p.spacer.style.height = (m.virt.length * rowHeight()) + "px";
+  p.spacer.style.position = "relative";
+  body.appendChild(p.spacer);
+  p.loCount.textContent = (p.container.rows || []).length + " rows · " +
+    (p.container.displayName || p.container.name || "");
+  paintLow(p);
+}
+
+function rowHeight() {
+  // One source of truth: the stylesheet. Two copies drift.
+  return parseFloat(getComputedStyle(document.documentElement).getPropertyValue("--row-height")) || 22;
+}
+
+function paintLow(p) {
+  if (!p.container) return;
+  const m = rowModel(p.container), H = rowHeight(), OVER = 20;
+  const top = Math.max(0, Math.floor(p.loBody.scrollTop / H) - OVER);
+  const bot = Math.min(m.virt.length, Math.ceil((p.loBody.scrollTop + p.loBody.clientHeight) / H) + OVER);
+  p.spacer.textContent = "";
+  p.loRowNodes = new Map();
+  const artifact = p.v.artifactHash;
+  for (let i = top; i < bot; i++) {
+    const item = m.virt[i];
+    const node = el("div", item.t === "inst" ? "row" : "marker");
+    node.style.position = "absolute";
+    node.style.top = (i * H) + "px";
+    node.style.left = "0"; node.style.right = "0";
+    if (item.t === "begin") node.textContent = "▸ " + (p.container.displayName || p.container.name || "") +
+      "  " + (p.container.start || "") + "–" + (p.container.stop || "");
+    else if (item.t === "end") node.textContent = "▴ end";
+    else if (item.t === "region") {
+      const r = item.r;
+      node.textContent = "  ".repeat(Math.max(0, r.level)) + "inline · " +
+        (r.displayFunction || r.function || "") +
+        (r.atFile ? " @ " + r.atFile + ":" + r.atLine : "") +
+        (r.calledAtFile ? " · called at " + r.calledAtFile + ":" + r.calledAtLine : "") +
+        (r.fragment ? " · fragment " + r.fragment[0] + "/" + r.fragment[1] : "");
+    } else {
+      const row = item.row;
+      const key = row.key || ["lo","1",enc("asm"),enc(p.v.id),enc(artifact),enc(row.address)].join("|");
+      const gut = el("div", "gut");
+      if (row.observed && row.observed.executions) {
+        const o = Math.min(1, Math.max(.22, Math.log2(row.observed.executions + 1) / 12));
+        gut.style.background = "var(--group)"; gut.style.opacity = String(o);
+      }
+      node.appendChild(gut);
+      node.appendChild(el("div", "n", row.address || ""));
+      node.appendChild(renderText(rowText(row)));
+      node.dataset.key = key;
+      node.tabIndex = 0;
+      node.setAttribute("aria-label", (row.address || "") + " " + rowText(row));
+      node.title = (row.frames || []).map((f, d) =>
+        "  ".repeat(d) + (frameFn(f) || "?") +
+        (frameFile(f) ? " @ " + frameFile(f) + ":" + f.line : "") +
+        (f.physical ? "  [physical]" : "")).join("\n");
+      const seeds = (row.frames || []).map(f => f.key).filter(Boolean);
+      node.addEventListener("pointerenter", () => setHover(preferred(seeds, p)));
+      node.addEventListener("pointerleave", () => setHover(null));
+      node.addEventListener("click", () => togglePin(preferred(seeds, p)));
+      node.addEventListener("dblclick", () => openNote(key, row));
+      p.loRowNodes.set(key, node);
+      if (S.notes && S.notes[key]) node.classList.add("noted");
+    }
+    p.spacer.appendChild(node);
+  }
+  applyClasses();
+}
+
+// Prefer the unit currently being viewed; expanding every frame across columns makes
+// the hovered column dominate (SKILL.md §7).
+function preferred(seeds, p) {
+  if (!seeds.length) return null;
+  const want = units[unitIndex] && units[unitIndex].id;
+  return seeds.find(k => { const f = parseKey(k); return f && f.unit === want; }) || seeds[0];
+}
+
+// ---- selection. Holds keys, never DOM nodes; mutates classes in place and never
+// re-renders, because repainting under the pointer fires pointerleave.
+function setHover(key) { sel.hover = key; applyClasses(); }
+function togglePin(key) {
+  if (!key) return;
+  const i = sel.pins.indexOf(key);
+  if (i >= 0) sel.pins.splice(i, 1);           // clicking a partner ADDS it
+  else { sel.pins.push(key); if (sel.pins.length > 7) sel.pins.shift(); }
+  applyClasses();
+}
+
+function applyClasses() {
+  const hov = sel.hover ? expand([sel.hover]) : null;
+  const pin = sel.pins.length ? expand(sel.pins) : null;
+  const tags = sel.tags;
+  const tagRows = new Map();
+  if (tags.size) for (const [k, ids] of Object.entries(S.lineTags || {}))
+    if (ids.some(t => tags.has(String(t)))) tagRows.set(k, ids);
+
+  for (const p of panels) {
+    for (const [key, nodes] of p.hiRows) {
+      const pj = project(key);
+      for (const n of nodes) {
+        n.classList.toggle("link", !!hov && (hov.all.has(key) || (pj && hov.proj.has(pj))));
+        n.classList.toggle("pin", !!pin && pin.seeds.has(key));
+        const partner = !!pin && !pin.seeds.has(key) && (pin.all.has(key) || (pj && pin.proj.has(pj)));
+        n.classList.toggle("group", partner);
+        n.classList.toggle("partner", partner);
+      }
+    }
+    if (!p.loRowNodes) continue;
+    for (const [key, node] of p.loRowNodes) {
+      const keys = keysOf(p, key);
+      const hit = set => keys.some(k => set.all.has(k) || (project(k) && set.proj.has(project(k))));
+      node.classList.toggle("link", !!hov && hit(hov));
+      node.classList.toggle("pin", !!pin && hit(pin));
+      node.classList.toggle("stack", !!hov && sel.hover != null &&
+        keys.includes(sel.hover) === false && hov.seeds.size > 0 &&
+        keys.some(k => { const a = parseKey(k), b = parseKey(sel.hover);
+                         return a && b && a.variant === b.variant && hov.all.has(k); }));
+      const ids = tagRows.get(key);
+      node.classList.toggle("tagged", !!ids);
+      if (ids) {
+        const t = (S.tags || []).find(x => String(x.id) === String(ids[0]));
+        if (t && t.color) node.style.setProperty("--tag-color", t.color);
+      }
+    }
+  }
+  const sig = (sel.hover || "") + "|" + sel.pins.join(",") + "|" + [...tags].join(",");
+  if (sig !== lastSignature) { lastSignature = sig; paintRails(hov, pin, tagRows); updateStatus(); }
+}
+
+function keysOf(p, lowKey) {
+  const node = p.loRowNodes.get(lowKey);
+  if (!node) return [];
+  if (node.__keys) return node.__keys;
+  const m = rowModel(p.container);
+  const idx = [...m.instRow.keys()].find(i => {
+    const r = p.container.rows[i];
+    return r && (r.key === lowKey || enc(r.address) === parseKey(lowKey)?.address);
+  });
+  const row = idx != null ? p.container.rows[idx] : null;
+  node.__keys = row ? (row.frames || []).map(f => f.key).filter(Boolean) : [];
+  return node.__keys;
+}
+
+// Rails: positions are fractions of scroll range, so a match with no DOM node is
+// still locatable. Merge adjacent marks only within one colour.
+function paintRails(hov, pin, tagRows) {
+  for (const p of panels) {
+    p.hiRail.textContent = ""; p.loRail.textContent = "";
+    if (p.container) {
+      const m = rowModel(p.container), total = m.virt.length;
+      const marks = [];
+      for (const [key, hits] of p.byHigh) {
+        const inHov = hov && hov.all.has(key), inPin = pin && pin.all.has(key);
+        if (!inHov && !inPin) continue;
+        for (const h of hits) if (h.c === p.container)
+          marks.push({ f: h.v / total, cls: inPin ? "pin" : "link" });
+      }
+      for (const mk of marks) {
+        const n = el("div", "rail-mark c");
+        n.style.top = (mk.f * 100) + "%";
+        n.style.background = mk.cls === "pin" ? "var(--pinned)" : "var(--linked)";
+        p.loRail.appendChild(n);
+      }
+      if (tagRows.size) {
+        (p.container.rows || []).forEach((r, i) => {
+          const key = r.key; if (!key || !tagRows.has(key)) return;
+          const n = el("div", "rail-mark t");
+          n.style.top = ((m.instRow.get(i) / total) * 100) + "%";
+          n.style.background = "var(--group)";
+          p.loRail.appendChild(n);
+        });
+      }
+      p.loRail.onclick = ev => {
+        const f = ev.offsetY / p.loRail.clientHeight;
+        p.loBody.scrollTop = f * p.spacer.offsetHeight - p.loBody.clientHeight / 2;
+      };
+    }
+    const h = p.hiBody.scrollHeight || 1;
+    for (const [key, nodes] of p.hiRows) {
+      const inHov = hov && (hov.all.has(key) || hov.proj.has(project(key)));
+      const inPin = pin && (pin.all.has(key) || pin.proj.has(project(key)));
+      if (!inHov && !inPin) continue;
+      for (const n of nodes) {
+        const mk = el("div", "rail-mark c");
+        mk.style.top = ((n.offsetTop / h) * 100) + "%";
+        mk.style.background = inPin ? "var(--pinned)" : "var(--linked)";
+        p.hiRail.appendChild(mk);
+      }
+    }
+    p.hiRail.onclick = ev => {
+      const f = ev.offsetY / p.hiRail.clientHeight;
+      p.hiBody.scrollTop = f * p.hiBody.scrollHeight - p.hiBody.clientHeight / 2;
+    };
+  }
+}
+
+function updateStatus() {
+  const bits = panels.map(p => (p.v.label || p.v.id) + " " +
+    ((p.container && (p.container.rows || []).length) || 0));
+  $("#status").textContent = bits.join(" · ") +
+    (sel.pins.length ? "  · " + sel.pins.length + " pinned" : "") +
+    (sel.tags.size ? "  · " + sel.tags.size + " tag(s)" : "") +
+    (S.writable ? "" : "  · read-only");
+}
+
+// ---- navigation
+function gotoUnit(i) {
+  if (!units.length) return;
+  unitIndex = (i + units.length) % units.length;
+  const u = units[unitIndex];
+  $("#unit").value = u.id;
+  for (const p of panels) {
+    const r = (u.realizations || {})[p.v.id];
+    const target = p.containers.find(c => (c.unitOccurrences || {})[u.id]) || p.container;
+    if (target && target !== p.container) { p.container = target; renderLow(p); }
+    const occ = p.container && (p.container.unitOccurrences || {})[u.id];
+    if (occ && occ.length) {
+      const m = rowModel(p.container);
+      const v = m.instRow.get(occ[0].startIndex) || 0;
+      p.loBody.scrollTop = Math.max(0, v * rowHeight() - p.loBody.clientHeight * 0.38);
+    }
+    if (r && r.status === "present" && r.startLine) {
+      for (const [key, nodes] of p.hiRows) {
+        const f = parseKey(key);
+        if (f && f.file === r.file && Number(f.line) === r.startLine && nodes[0]) {
+          p.hiBody.scrollTop = Math.max(0, nodes[0].offsetTop - p.hiBody.clientHeight * 0.3);
+          break;
+        }
+      }
+    }
+  }
+  updateStatus();
+}
+
+// ---- notes
+let noteKey = null;
+function openNote(key, row) {
+  if (!S.writable) return;
+  noteKey = key;
+  $("#noteaddr").textContent = (row.address || "") + "   " + rowText(row);
+  $("#note").value = (S.notes && S.notes[key]) || "";
+  $("#notedlg").showModal();
+}
+$("#notesave").addEventListener("click", async () => {
+  const body = $("#note").value;
+  const res = await fetch("/api/note", { method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ key: noteKey, body }) }).then(r => r.json());
+  if (res.ok) { S = res.state; panels.forEach(paintLow); }
+});
+
+// ---- tags
+function openTags() {
+  const list = $("#taglist"); list.textContent = "";
+  for (const t of S.tags || []) {
+    const row = el("label", null);
+    row.style.display = "flex"; row.style.gap = "8px"; row.style.padding = "3px 0";
+    const cb = el("input"); cb.type = "checkbox"; cb.checked = sel.tags.has(String(t.id));
+    cb.addEventListener("change", () => {
+      cb.checked ? sel.tags.add(String(t.id)) : sel.tags.delete(String(t.id));
+      $("#tagbtn").setAttribute("aria-pressed", String(sel.tags.size > 0));
+      applyClasses();
+    });
+    const dot = el("span", "dot"); dot.style.background = t.color || "var(--muted)";
+    row.append(cb, dot, el("span", null, t.label || t.id));
+    list.appendChild(row);
+  }
+  if (!(S.tags || []).length) list.appendChild(el("div", "empty", "no tags in the store"));
+  $("#tagdlg").showModal();
+}
+
+// ---- boot
+async function boot() {
+  B = await fetch("/bundle.json").then(r => r.json());
+  S = await fetch("/api/state").then(r => r.json());
+  const declared = B.corpus && B.corpus.variantCount;
+  if (declared != null && declared !== (B.variants || []).length)
+    throw new Error("bundle declares " + declared + " variants but carries " + B.variants.length);
+  scope = ((B.corpus || {}).correspondence || {}).autoLink || ["variant", "unit", "file", "line"];
+  FAM = buildFamilies();
+  units = (B.units || []).slice().sort((a, b) => (a.order || 0) - (b.order || 0));
+  const usel = $("#unit");
+  for (const u of units) usel.appendChild(Object.assign(el("option", null, u.title || u.id), { value: u.id }));
+  usel.addEventListener("change", () => gotoUnit(units.findIndex(u => u.id === usel.value)));
+  build();
+  if (units.length) gotoUnit(0);
+  updateStatus();
+  $("#prev").onclick = () => gotoUnit(unitIndex - 1);
+  $("#next").onclick = () => gotoUnit(unitIndex + 1);
+  $("#clear").onclick = () => { sel.pins = []; sel.tags.clear();
+    $("#tagbtn").setAttribute("aria-pressed", "false"); applyClasses(); };
+  $("#tagbtn").onclick = openTags;
+  $("#theme").onclick = () => {
+    const cur = document.documentElement.getAttribute("data-theme");
+    document.documentElement.setAttribute("data-theme", cur === "light" ? "dark" : "light");
+  };
+  addEventListener("keydown", ev => {
+    if (/^(INPUT|TEXTAREA|SELECT)$/.test(ev.target.tagName) || document.querySelector("dialog[open]")) return;
+    if (ev.key === "ArrowDown") { gotoUnit(unitIndex + 1); ev.preventDefault(); }
+    else if (ev.key === "ArrowUp") { gotoUnit(unitIndex - 1); ev.preventDefault(); }
+    else if (ev.key === "Escape") $("#clear").click();
+    else if (ev.key === "t" || ev.key === "T") openTags();
+  });
+}
+boot().catch(err => { $("#status").textContent = "error: " + err.message; throw err; });
+})();
+</script>
+</body>
+</html>
+"""
+
+
+# --------------------------------------------------------------------------- main
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="asmviz", description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    c = sub.add_parser("check", help="validate a bundle and an annotation store")
+    c.add_argument("bundle")
+    c.add_argument("--annotations", "-a", default=None)
+    c.set_defaults(func=cmd_check)
+
+    s = sub.add_parser("stats", help="counts, coverage, mapping-quality counters")
+    s.add_argument("bundle")
+    s.add_argument("--annotations", "-a", default=None)
+    s.set_defaults(func=cmd_stats)
+
+    k = sub.add_parser("chunks", help="propose a partition into annotation work chunks")
+    k.add_argument("bundle")
+    k.add_argument("--annotations", "-a", default="annotations")
+    k.add_argument("--by", choices=("unit", "container", "file"), default="unit")
+    k.add_argument("--size", type=int, default=120, help="target rows per chunk (default 120)")
+    k.add_argument("--write", action="store_true", help="merge the proposal into chunks.json")
+    k.set_defaults(func=cmd_chunks)
+
+    v = sub.add_parser("serve", help="serve the reference 2xN workspace")
+    v.add_argument("bundle")
+    v.add_argument("--annotations", "-a", default=None)
+    v.add_argument("--port", "-p", type=int, default=8731)
+    v.add_argument("--verbose", action="store_true")
+    v.set_defaults(func=cmd_serve)
+
+    args = ap.parse_args(argv)
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

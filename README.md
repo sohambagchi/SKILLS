@@ -7,6 +7,8 @@ Personal agent skills. One skill per directory, each loadable alone, all composa
 | Skill | Description |
 |---|---|
 | [amail](amail/SKILL.md) | Messages other independent agent instances with AgentMail, a folder of markdown mail files. Uses `/proj` on CloudLab, and `~/amail` elsewhere when the user asks. Includes `amail-tui`, a read-only browser for humans. |
+| [asm-analysis](asm-analysis/SKILL.md) | Standardizes a cross-variant workspace that puts N programs side by side in two aligned rows — authored source on top, generated code below — with a portable bundle format, a git-tracked annotation store, and workflows for extracting the mapping, chunking the corpus for annotation, and keeping both current. Includes `asmviz`, a validator and reference viewer. |
+| [code-comments](code-comments/SKILL.md) | Decides what code needs a comment, what doesn't, how long the comment should be, and when an explanation is too big for a comment and belongs in a document instead. |
 | [docky](docky/SKILL.md) | Maintains a project's `docs/` tree: timestamped ADRs, changelogs and analysis reports, plus TODO, index and a stale archive, kept brief and non-overlapping. |
 | [experiment-infrastructure](experiment-infrastructure/SKILL.md) | Builds experiment infrastructure tailored to a project: self-contained timestamped results with provenance, raw-first parsing, validity, resumable runs, safe reuse, and plotting conventions. No framework; each project gets its own. |
 | [use-nix](use-nix/SKILL.md) | Uses `flake.nix` whenever possible; if nix is missing, says so and offers the Determinate Systems installer. |
