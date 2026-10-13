@@ -27,7 +27,7 @@ whatever session runs next. Simple decisions stay in the chat.
 ## 1. Layout
 
 ```
-.arty                 tracked pointer: console = <url>, project, schema
+.arty                 tracked pointer: console = <url>, project, schema, docs paths
 <console artifact>    one per project: inbox, maps, reports, timeline
 <exhibit artifacts>   the heavy visuals, registered as rows in the console
 ```
@@ -35,6 +35,21 @@ whatever session runs next. Simple decisions stay in the chat.
 Read `.arty` first. No pointer means no console — offer section 2, don't invent one.
 The pointer is the only thing arty adds to the repository: live state is never
 mirrored into git, and the console is never the home of an ADR.
+
+Sync reads records from docky's `docs/adr/`, `docs/changelog/` and `docs/stale/`.
+A repository laid out otherwise names its own in `.arty`, one optional line each:
+
+```
+adr_dir = docs/ADR
+changelog_dir = docs/changelog
+stale_dir = docs/archive
+```
+
+A named directory that does not exist stops sync; it never reads as zero records.
+An ADR's status is the first word of its `**Status:**` line, bare or as a list item
+(`superseded` and `reversed` both show as superseded; `Accepted; amended by …` stays
+accepted). Its summary is the `**Decision:**` line, else the first paragraph or item
+under `## Decision`.
 
 ## 2. Setup
 
@@ -201,7 +216,8 @@ arty check --db "$DUMP"
 write_db db_op=batch writes=<the entries sync printed>
 ```
 
-Sync projects `docs/adr/` and `docs/changelog/` into `records`, and recomputes each
+Sync projects the ADR and changelog directories (section 1) into `records`, and
+prints how many files it read from each and which it skipped. It recomputes each
 map's staleness as `git log <commit>..HEAD -- <anchors>` — so the page can name the
 commits that may have invalidated it. It merges, never replaces: authored fields
 survive.

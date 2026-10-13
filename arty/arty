@@ -44,8 +44,11 @@ MAX_OPEN_PROPOSALS = 6
 MAX_LIVE_MAPS = 12
 BLOCKING_AGE_DAYS = 7
 
-DOCKY = {"adr": "docs/adr", "changelog": "docs/changelog"}
-STALE_DIR = "docs/stale"
+# Where sync reads records from. These are docky's paths; a repository laid
+# out differently names its own in .arty (`adr_dir = docs/ADR`), because the
+# layout is a fact about the project and this file knows none.
+DOCS_DIRS = {"adr": "docs/adr", "changelog": "docs/changelog", "stale": "docs/stale"}
+LIST_MARK = re.compile(r"^(?:[-*+]|\d+[.)])\s+")
 STAMP = re.compile(r"^(\d{4}-\d{2}-\d{2})-(\d{4})-([a-z0-9][a-z0-9-]*)\.md$")
 ID = {
     "proposals": re.compile(r"^p-\d{8}-\d{4}-[a-z0-9][a-z0-9-]*$"),
@@ -137,6 +140,71 @@ def first_line(text, prefix):
     return ""
 
 
+def field(text, label):
+    """A `**Label:**` value, written bare (docky) or as a list item (`- **Label:**`)."""
+    prefix = "**%s:**" % label
+    for line in text.splitlines():
+        line = LIST_MARK.sub("", line, count=1)
+        if line.startswith(prefix):
+            return line[len(prefix):].strip()
+    return ""
+
+
+def section(text, heading):
+    """The first paragraph or first list item under `## <heading>`, or ""."""
+    out, inside, fence = [], False, False
+    for line in text.splitlines():
+        if not inside:
+            inside = line.strip().lower() == "## " + heading.lower()
+            continue
+        if line.startswith("```"):
+            if out:
+                break
+            fence = not fence
+            continue
+        if fence:
+            continue
+        if re.match(r"#{1,2}\s", line):
+            break
+        if not line.strip() or line.startswith("#"):
+            if out:
+                break
+            continue
+        if out and LIST_MARK.match(line):
+            break  # the first item only
+        out.append(LIST_MARK.sub("", line, count=1))
+    return re.sub(r"\*\*|__", "", " ".join(out))
+
+
+def adr_status(raw):
+    """Status from the first word of the Status value.
+
+    docky writes `accepted | superseded by <file>`; other templates qualify it
+    (`Accepted. Amends <file>`, `Accepted; partly superseded by <file>`) or add
+    `Reversed by <file>`. A decision only amended or partly overtaken still
+    stands, so only the leading word counts, and a reversal is shown as the
+    superseded decision it is.
+    """
+    m = re.search(r"[a-z]+", raw.lower())
+    if not m:
+        return "accepted"
+    word = m.group(0)
+    return "superseded" if word in ("superseded", "reversed") else word
+
+
+def first_bullet(text):
+    """The first list item, past any `- **Date:** ...` header block under the title."""
+    header = True
+    for line in text.splitlines():
+        if header and (not line.strip() or line.startswith("# ") or line.startswith("  ")
+                       or re.match(r"[-*+]\s+\*\*[^*]+:\*\*", line)):
+            continue
+        header = False
+        if line.startswith("- "):
+            return line[2:]
+    return ""
+
+
 def one_line(text, limit=160):
     text = re.sub(r"\s+", " ", text).strip()
     text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)  # links to their text
@@ -153,17 +221,14 @@ def read_record(path, kind, status=None):
         text = fh.read()
     title = first_line(text, "# ")
     if kind == "adr":
-        raw = first_line(text, "**Status:**").lower()
-        status = status or ("superseded" if "superseded" in raw else (raw.split()[0] if raw else "accepted"))
-        summary = first_line(text, "**Decision:**") or first_line(text, "**Context:**")
+        status = status or adr_status(field(text, "Status"))
+        summary = (field(text, "Decision") or section(text, "Decision")
+                   or field(text, "Context") or section(text, "Context"))
     else:
         status = status or "accepted"
         summary = ""
     if not summary:
-        for line in text.splitlines():
-            if line.startswith("- "):
-                summary = line[2:]
-                break
+        summary = first_bullet(text)
     return {
         "kind": "adr" if kind == "adr" else "changelog",
         "title": one_line(title, 90),
@@ -173,45 +238,74 @@ def read_record(path, kind, status=None):
     }
 
 
-def scan_docky(root):
-    """Project docs/adr and docs/changelog into desired `records` rows.
+def docs_dirs(root):
+    """The record directories: docky's, unless .arty names others.
+
+    A directory .arty names must exist. A typo there would otherwise project
+    zero records, which looks exactly like a project that has none.
+    """
+    pointer = read_pointer(root)
+    dirs = {}
+    for kind, default in DOCS_DIRS.items():
+        rel = pointer.get(kind + "_dir", "").strip().rstrip("/")
+        if rel and not os.path.isdir(os.path.join(root, rel)):
+            die("%s sets %s_dir = %s, and %s is not a directory"
+                % (POINTER, kind, rel, os.path.join(root, rel)))
+        dirs[kind] = rel or default
+    return dirs
+
+
+def scan_docky(root, tally=None):
+    """Project the ADR and changelog directories into desired `records` rows.
 
     Derived fields only. Whatever the agent added to a row -- the proposal it
     came from, the exhibits that argued it -- is never computed here, so sync
     merges and never replaces (SKILL.md section 6).
+
+    `tally`, if given, is filled with {directory: {key, records, skipped[],
+    absent}}, so the caller can print what was not read as well as what was.
     """
     want = {}
+    dirs = docs_dirs(root)
+    tally = {} if tally is None else tally
 
     def take(directory, name, kind, status=None):
         m = STAMP.match(name)
         if not m:
+            tally[directory]["skipped"].append(name)
             return
         date, hhmm, slug = m.groups()
         rid = record_id(kind, date, hhmm, slug)
         if rid in want:
-            return  # a live file always beats a copy under docs/stale/
+            return  # a live file always beats a copy under the stale directory
         row = read_record(os.path.join(root, directory, name), kind, status)
         row["date"] = date
         row["time"] = "%s:%s" % (hhmm[:2], hhmm[2:])
         row["path"] = "%s/%s" % (directory, name)
         want[rid] = row
+        tally[directory]["records"] += 1
 
-    for kind, rel in DOCKY.items():
-        directory = os.path.join(root, rel)
-        if os.path.isdir(directory):
-            for name in sorted(os.listdir(directory)):
-                take(rel, name, kind)
+    def names(kind):
+        rel = dirs[kind]
+        absent = not os.path.isdir(os.path.join(root, rel))
+        tally[rel] = {"key": kind + "_dir", "records": 0, "skipped": [], "absent": absent}
+        return [] if absent else sorted(os.listdir(os.path.join(root, rel)))
 
-    # docs/stale/ holds both kinds, so the kind comes from the file: docky's ADR
-    # template is the only one with a Status line.
-    directory = os.path.join(root, STALE_DIR)
-    if os.path.isdir(directory):
-        for name in sorted(os.listdir(directory)):
-            if not STAMP.match(name):
-                continue
-            with open(os.path.join(directory, name)) as fh:
-                head = fh.read(4096)
-            take(STALE_DIR, name, "adr" if "**Status:**" in head else "changelog", status="stale")
+    for kind in ("adr", "changelog"):
+        for name in names(kind):
+            take(dirs[kind], name, kind)
+
+    # The stale directory holds both kinds, so the kind comes from the file:
+    # an ADR template is the only one with a Status line.
+    stale = dirs["stale"]
+    for name in names("stale"):
+        path = os.path.join(root, stale, name)
+        if not STAMP.match(name) or not os.path.isfile(path):
+            tally[stale]["skipped"].append(name)
+            continue
+        with open(path) as fh:
+            head = fh.read(4096)
+        take(stale, name, "adr" if "**Status:**" in head else "changelog", status="stale")
 
     return want
 
@@ -273,11 +367,15 @@ def cmd_init(args):
         die("not an artifact url: %s" % args.url)
     name = args.name or os.path.basename(root)
     pointer = os.path.join(root, POINTER)
+    keep = read_pointer(root)  # a re-init must not drop the docs paths
     with open(pointer, "w") as fh:
         fh.write("# The project console. Live state lives there, not here.\n")
         fh.write("console = %s\n" % args.url)
         fh.write("project = %s\n" % name)
         fh.write("schema = %d\n" % SCHEMA)
+        for kind in DOCS_DIRS:
+            if keep.get(kind + "_dir"):
+                fh.write("%s_dir = %s\n" % (kind, keep[kind + "_dir"]))
     remote = git("remote", "get-url", "origin", check=False)
     seed = {
         "project": name,
@@ -324,7 +422,8 @@ def cmd_sync(args):
         notes.append("  %-6s %s/%s  (%s)" % (op, collection, doc, note))
 
     have = rows.get("records", {})
-    want = scan_docky(root)
+    tally = {}
+    want = scan_docky(root, tally)
     for rid, body in sorted(want.items()):
         if rid not in have:
             entry("set", "records", rid, body, "new %s" % body["kind"])
@@ -348,6 +447,19 @@ def cmd_sync(args):
             if not patch:
                 notes.append("  %-6s maps/%s  (%s)" % ("skip", mid, note))
 
+    # Zero records reads the same as a wrong directory, so say where each count
+    # came from and what was passed over.
+    for rel, t in tally.items():
+        if t["absent"]:
+            print("read: %s/ absent (set %s in %s if the records live elsewhere)"
+                  % (rel, t["key"], POINTER))
+        else:
+            skipped = t["skipped"]
+            print("read: %s/ %d record%s%s" % (
+                rel, t["records"], "" if t["records"] == 1 else "s",
+                ", skipped %d not named YYYY-MM-DD-HHMM-slug.md: %s%s" % (
+                    len(skipped), ", ".join(skipped[:4]), ", …" if len(skipped) > 4 else "")
+                if skipped else ""))
     print("plan: %d write%s, %d row%s unchanged" % (
         len(plan), "" if len(plan) == 1 else "s", quiet, "" if quiet == 1 else "s"))
     for line in notes:
