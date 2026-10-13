@@ -64,4 +64,4 @@ sh ~/dev/SKILLS/claudia.sh
 curl -fsSL https://raw.githubusercontent.com/sohambagchi/SKILLS/main/claudia.sh | sh
 ```
 
-Then open a new shell, run `claudia`, and `/login`. Set `CLAUDIA_DIR` to use a different directory. Skills symlinked into `~/.claude/skills/` aren't visible to `claudia`, so symlink them into `~/.claudia/skills/` as well.
+Then open a new shell, run `claudia`, and `/login`. Set `CLAUDIA_DIR` to use a different directory. The script also links every skill in `~/.claude/skills/` into `~/.claudia/skills/`, so both logins load the same skills; rerun it after adding a skill. Each account's own claude.ai skills (`synced/`) stay separate.

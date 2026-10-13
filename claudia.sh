@@ -81,7 +81,20 @@ done
 
 [ "$mode" = uninstall ] && { echo "claudia: kept $dir"; exit 0; }
 
-mkdir -p "$dir"
+mkdir -p "$dir/skills"
+# Links each personal skill `claude` has, so both logins load the same set.
+# synced/ holds the account's own claude.ai skills, so each login keeps its own.
+linked=0
+for s in "$HOME"/.claude/skills/*; do
+  name=$(basename "$s")
+  [ "$name" = synced ] && continue
+  [ -e "$s" ] || continue
+  if [ ! -e "$dir/skills/$name" ] && [ ! -L "$dir/skills/$name" ]; then
+    ln -s "$s" "$dir/skills/$name"
+    linked=$((linked + 1))
+  fi
+done
+echo "claudia: linked $linked skill(s) from ~/.claude/skills into $dir/skills"
 command -v claude >/dev/null 2>&1 ||
   echo "claudia: \`claude\` is not on PATH yet; install Claude Code before running claudia" >&2
 echo "claudia: open a new shell, run \`claudia\`, then /login with the second account"
