@@ -358,6 +358,27 @@ def cmd_sync(args):
             print("  " + json.dumps(item, sort_keys=True))
 
 
+FIGURE_SRC = re.compile(r"^(https://\S+|[A-Za-z0-9_][A-Za-z0-9_./-]*)$")
+FIGURE_RENDERING = ("auto", "smooth", "pixelated", "crisp-edges")
+
+
+def check_figures(where, row, err):
+    """Inline figures: files published beside the console, or https images."""
+    figures = row.get("figures")
+    if figures is None:
+        return
+    if not isinstance(figures, list):
+        err(where, "figures is not a list")
+        return
+    for n, fig in enumerate(figures):
+        src = fig.get("src") if isinstance(fig, dict) else None
+        if not src or not FIGURE_SRC.match(str(src)) or ".." in str(src):
+            err(where, "figures[%d].src %r is not a relative path or https url" % (n, src))
+    rendering = row.get("figure_rendering")
+    if rendering is not None and rendering not in FIGURE_RENDERING:
+        err(where, "figure_rendering %r not in %s" % (rendering, "|".join(FIGURE_RENDERING)))
+
+
 def cmd_check(args):
     root = repo_root()
     os.chdir(root)
@@ -435,9 +456,12 @@ def cmd_check(args):
         where = "maps/%s" % doc
         if row.get("status") not in MAP_STATUS:
             err(where, "status %r not in %s" % (row.get("status"), "|".join(MAP_STATUS)))
-        for field in ("title", "purpose", "url"):
+        for field in ("title", "purpose"):
             if not row.get(field):
                 err(where, "no %s" % field)
+        if not row.get("url") and not row.get("markdown") and not row.get("figures"):
+            err(where, "neither an exhibit url nor inline markdown or figures")
+        check_figures(where, row, err)
         if row.get("status") != "retired" and not row.get("anchors"):
             err(where, "no anchors -- nothing to go stale against")
         claims = row.get("claims") or {}
@@ -452,8 +476,9 @@ def cmd_check(args):
         for field in ("title", "question"):
             if not row.get(field):
                 err(where, "no %s" % field)
-        if not row.get("url") and not row.get("markdown"):
-            err(where, "neither an exhibit url nor inline markdown")
+        if not row.get("url") and not row.get("markdown") and not row.get("figures"):
+            err(where, "neither an exhibit url nor inline markdown or figures")
+        check_figures(where, row, err)
 
     for doc, row in sorted(rows.get("records", {}).items()):
         where = "records/%s" % doc
@@ -778,6 +803,28 @@ padding:var(--space-4);font:400 var(--text-xs)/1.6 var(--font-mono)}
 .diff pre .add{color:var(--success)}
 .diff pre .del{color:var(--danger)}
 .diff pre .hunk{color:var(--text-subtle)}
+
+/* —— figures: inline pictures on a map or report row —— */
+.figs{display:grid;gap:var(--space-6)}
+.figs__g{display:grid;gap:var(--space-4)}
+.figs__h{font:500 var(--text-micro)/1.2 var(--font-mono);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-subtle)}
+.figs__grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(100%,300px),1fr));gap:var(--space-5)}
+.fig{margin:0;display:grid;gap:var(--space-3);align-content:start;min-width:0}
+.fig__btn{appearance:none;display:block;width:100%;padding:var(--space-3);cursor:zoom-in;background:var(--bg-sunken);
+border:var(--hairline) solid var(--line-1);border-radius:var(--radius-md);transition:border-color var(--dur-quick) var(--ease-drift)}
+.fig__btn:hover{border-color:var(--thread)}
+.fig__btn:focus-visible{outline:none;box-shadow:var(--shadow-focus)}
+.fig__btn img{display:block;width:100%;height:auto;max-height:260px;object-fit:contain;object-position:left top}
+.fig figcaption{font:400 var(--text-sm)/var(--leading-normal) var(--font-serif);color:var(--text-muted)}
+.fig figcaption b{font:500 var(--text-xs)/1.4 var(--font-mono);color:var(--text-body);margin-right:var(--space-3)}
+.lb{position:fixed;inset:0;z-index:50;display:grid;grid-template-rows:auto 1fr;background:var(--surface-overlay);
+-webkit-backdrop-filter:blur(6px);backdrop-filter:blur(6px);padding:calc(var(--space-5) + env(safe-area-inset-top,0px)) var(--space-5) calc(var(--space-5) + env(safe-area-inset-bottom,0px))}
+.lb__bar{display:flex;gap:var(--space-4);align-items:center;justify-content:space-between;background:var(--bg-surface);
+border:var(--hairline) solid var(--line-1);border-bottom:0;border-radius:var(--radius-md) var(--radius-md) 0 0;padding:var(--space-3) var(--space-4)}
+.lb__cap{font:400 var(--text-sm)/1.4 var(--font-serif);color:var(--text-muted);min-width:0}
+.lb__cap b{font:500 var(--text-xs)/1.4 var(--font-mono);color:var(--text-body);margin-right:var(--space-3)}
+.lb__scroll{overflow:auto;background:var(--bg-sunken);border:var(--hairline) solid var(--line-1);border-radius:0 0 var(--radius-md) var(--radius-md);min-height:0}
+.lb__scroll img{display:block;max-width:none;margin:var(--space-4)}
 .mermaid{background:var(--bg-sunken);border:var(--hairline) solid var(--line-1);border-radius:var(--radius-md);padding:var(--space-5);
 overflow-x:auto;text-align:center;font-family:var(--font-mono);font-size:var(--text-xs)}
 
@@ -836,6 +883,11 @@ padding:var(--space-4) var(--space-5);display:grid;gap:var(--space-2);animation:
 </main>
 
 <div class="toasts" id="toasts" aria-live="polite"></div>
+
+<div class="lb" id="lightbox" role="dialog" aria-modal="true" aria-label="Figure" hidden>
+  <div class="lb__bar"><span class="lb__cap" id="lb-cap"></span><button class="btn btn--ghost" id="lb-close" type="button"><span>Close</span></button></div>
+  <div class="lb__scroll" id="lb-scroll"><img id="lb-img" alt=""></div>
+</div>
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
 <script>
@@ -989,6 +1041,69 @@ function wireRelations(scope) {
   });
 }
 
+/* —— figures: rows may carry pictures published alongside the console —— */
+const RENDERING = {pixelated: "pixelated", "crisp-edges": "crisp-edges", auto: "auto", smooth: "auto"};
+function figSrc(src) {
+  const s = String(src || "");
+  if (/^https:\/\//.test(s)) return s;
+  if (/^[A-Za-z0-9_][A-Za-z0-9_.\-\/]*$/.test(s) && !s.includes("..")) return s;
+  return "";
+}
+function isInline(row) {
+  return !row.url && (row.markdown || (row.figures || []).length);
+}
+function figures(row) {
+  const list = (row.figures || []).filter(f => f && figSrc(f.src));
+  if (!list.length) return "";
+  const render = RENDERING[row.figure_rendering] || "auto";
+  const groups = [];
+  list.forEach(f => {
+    const g = String(f.group || "");
+    let bucket = groups.find(x => x.name === g);
+    if (!bucket) groups.push(bucket = {name: g, items: []});
+    bucket.items.push(f);
+  });
+  return '<div class="figs">' + groups.map(g =>
+    '<section class="figs__g">' + (g.name ? '<h3 class="figs__h">' + esc(g.name) + "</h3>" : "") +
+    '<div class="figs__grid">' + g.items.map(f => {
+      const name = String(f.src).split("/").pop().replace(/\.[a-z0-9]+$/i, "");
+      return '<figure class="fig"><button class="fig__btn" type="button" data-fig="' + esc(figSrc(f.src)) + '" data-render="' + render +
+        '" data-name="' + esc(f.title || name) + '" data-cap="' + esc(f.caption || "") + '">' +
+        '<img loading="lazy" decoding="async" src="' + esc(figSrc(f.src)) + '" alt="' + esc(f.caption || name) + '" style="image-rendering:' + render + '"></button>' +
+        '<figcaption><b>' + esc(f.title || name) + "</b>" + esc(f.caption || "") + "</figcaption></figure>";
+    }).join("") + "</div></section>").join("") + "</div>";
+}
+function inlineBody(row) {
+  if (!isInline(row)) return "";
+  const n = (row.figures || []).length;
+  const label = n ? n + (n === 1 ? " figure" : " figures") : "Read";
+  return '<details class="ev" data-key="' + esc("inline:" + row.id) + '"><summary>' + esc(label) + '</summary><div class="ev__body">' +
+    (row.markdown ? md(row.markdown) : "") + figures(row) + "</div></details>";
+}
+function openFigure(btn) {
+  const img = el("lb-img");
+  img.src = btn.dataset.fig;
+  img.style.imageRendering = btn.dataset.render || "auto";
+  img.alt = btn.dataset.cap || btn.dataset.name || "";
+  el("lb-cap").innerHTML = "<b>" + esc(btn.dataset.name) + "</b>" + esc(btn.dataset.cap);
+  el("lightbox").hidden = false;
+  el("lb-scroll").scrollTo(0, 0);
+  el("lb-close").focus();
+  openFigure.from = btn;
+}
+function closeFigure() {
+  if (el("lightbox").hidden) return;
+  el("lightbox").hidden = true;
+  el("lb-img").removeAttribute("src");
+  if (openFigure.from) openFigure.from.focus();
+}
+document.addEventListener("click", e => {
+  const btn = e.target.closest && e.target.closest(".fig__btn");
+  if (btn) { openFigure(btn); return; }
+  if (e.target.id === "lightbox" || (e.target.closest && e.target.closest("#lb-close"))) closeFigure();
+});
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeFigure(); });
+
 /* —— views —— */
 function emptyState(kind, line) {
   return '<div class="empty"><p>' + esc(line) + "</p><code>" + esc(ARTY[kind]) + "</code></div>";
@@ -998,7 +1113,7 @@ function keep(view) {
   const draft = {notes: {}, picked: {}, open: []};
   view.querySelectorAll("textarea").forEach(t => { if (t.value) draft.notes[t.id] = t.value; });
   view.querySelectorAll("input[type=radio]:checked").forEach(r => draft.picked[r.name] = r.value);
-  view.querySelectorAll("details[open]").forEach(d => draft.open.push(d.querySelector("summary").textContent));
+  view.querySelectorAll("details[open]").forEach(d => draft.open.push(d.dataset.key || d.querySelector("summary").textContent));
   return draft;
 }
 function restore(view, draft) {
@@ -1008,7 +1123,7 @@ function restore(view, draft) {
     if (r) r.checked = true;
   });
   view.querySelectorAll("details").forEach(d => {
-    if (draft.open.includes(d.querySelector("summary").textContent)) d.open = true;
+    if (draft.open.includes(d.dataset.key || d.querySelector("summary").textContent)) d.open = true;
   });
 }
 
@@ -1126,6 +1241,7 @@ function renderMaps() {
   const live = state.maps.filter(m => m.status !== "retired")
     .sort((a, b) => (a.status === "stale" ? 0 : 1) - (b.status === "stale" ? 0 : 1) || String(a.title || "").localeCompare(String(b.title || "")));
   const retired = state.maps.filter(m => m.status === "retired");
+  const draft = keep(view);
   const html = [];
   if (!live.length) {
     html.push(emptyState("maps", state.ready ? "No maps are registered." : "Reading the console…"));
@@ -1134,7 +1250,9 @@ function renderMaps() {
   }
   if (retired.length) html.push(archive(retired, "retired"));
   view.innerHTML = html.join("");
+  restore(view, draft);
   wireRelations(view);
+  drawDiagrams(view);
 }
 
 function mapRow(m, i) {
@@ -1149,7 +1267,7 @@ function mapRow(m, i) {
       '<div class="legend">' + CLAIMS.filter(k => Number(counts[k])).map(k =>
         '<span><i style="background:' + (k === "unverified" ? "var(--stone-400)" : "var(--" + CLAIM_TONE[k] + ")") + '"></i>' +
         counts[k] + " " + k + "</span>").join("") + "</div>"
-    : '<div class="legend"><span>no claims recorded</span></div>';
+    : isInline(m) ? "" : '<div class="legend"><span>no claims recorded</span></div>';
 
   const why = stale && (m.invalidated_by || []).length
     ? '<div class="row__why">' + m.invalidated_by.slice(0, 5).map(c =>
@@ -1158,14 +1276,16 @@ function mapRow(m, i) {
         ? '<span class="commit">and ' + (m.invalidated_count - m.invalidated_by.length) + " more</span>" : "") + "</div>"
     : "";
 
-  return '<a class="row" href="' + esc(m.url || "#") + '" target="_blank" rel="noopener" data-anchors="' + esc(JSON.stringify(m.anchors || [])) + '">' +
+  const own = isInline(m);
+  return (own ? '<div class="row"' : '<a class="row" href="' + esc(m.url || "#") + '" target="_blank" rel="noopener"') +
+    ' data-anchors="' + esc(JSON.stringify(m.anchors || [])) + '">' +
     '<span class="row__i">' + String(i + 1).padStart(2, "0") + "</span>" +
-    '<div class="row__main"><span class="row__t">' + esc(m.title || m.id) + ' <span class="ext">&#8599;</span></span>' +
+    '<div class="row__main"><span class="row__t">' + esc(m.title || m.id) + (own ? "" : ' <span class="ext">&#8599;</span>') + "</span>" +
     (m.purpose ? '<span class="row__sub">' + esc(m.purpose) + "</span>" : "") +
-    (m.anchors && m.anchors.length ? tags(m.anchors) : "") + why + "</div>" +
+    (m.anchors && m.anchors.length ? tags(m.anchors) : "") + why + inlineBody(m) + "</div>" +
     '<div class="row__side">' + (stale ? badge("stale", "danger", {dot: true}) : badge("current", "success", {dot: true})) +
     '<div class="claims">' + bar + "</div>" +
-    '<span class="meta">' + (m.refreshed_at ? "refreshed " + esc(ago(m.refreshed_at)) : "") + "</span></div></a>";
+    '<span class="meta">' + (m.refreshed_at ? "refreshed " + esc(ago(m.refreshed_at)) : "") + "</span></div>" + (own ? "</div>" : "</a>");
 }
 
 function renderReports() {
@@ -1173,6 +1293,7 @@ function renderReports() {
   const live = state.reports.filter(r => r.status === "current")
     .sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")));
   const done = state.reports.filter(r => r.status !== "current");
+  const draft = keep(view);
   const html = [];
   if (!live.length) {
     html.push(emptyState("reports", state.ready ? "No open questions have a report." : "Reading the console…"));
@@ -1183,7 +1304,7 @@ function renderReports() {
       '<span class="row__i">' + String(i + 1).padStart(2, "0") + "</span>" +
       '<div class="row__main"><span class="row__t">' + esc(r.title || r.id) + (r.url ? ' <span class="ext">&#8599;</span>' : "") + "</span>" +
       (r.question ? '<span class="row__sub">' + esc(r.question) + "</span>" : "") +
-      (r.answer ? md(r.answer) : "") + (r.markdown && !r.url ? md(r.markdown) : "") +
+      (r.answer ? md(r.answer) : "") + inlineBody(r) +
       (r.anchors && r.anchors.length ? tags(r.anchors) : "") + "</div>" +
       '<div class="row__side"><span class="meta">' + esc(fmtDate(r.date)) + "</span>" +
       (r.path ? '<span class="meta">' + esc(r.path) + "</span>" : "") + "</div>" +
@@ -1191,6 +1312,7 @@ function renderReports() {
   }
   if (done.length) html.push(archive(done, "settled"));
   view.innerHTML = html.join("");
+  restore(view, draft);
   wireRelations(view);
   drawDiagrams(view);
 }

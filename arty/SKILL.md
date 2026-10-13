@@ -76,7 +76,13 @@ proposals/p-YYYYMMDD-HHMM-slug
   outcome        {adr, changelog, acked_at}        written by the agent
 
 maps/m-slug
-  title, purpose, url
+  title, purpose
+  url            the exhibit -- or, for an inline map, none:
+  markdown       inline body, shown in the console
+  figures[]      {src, title?, caption, group?}  images shown in the console;
+                 src is figures/<map-slug>/<file> published with the console,
+                 or an https url
+  figure_rendering   auto | smooth | pixelated | crisp-edges   (optional)
   anchors[]      pathspecs the map describes       (required)
   commit         HEAD when it was last refreshed
   refreshed_at
@@ -87,7 +93,8 @@ maps/m-slug
 reports/r-YYYYMMDD-slug
   title, question, answer, date, anchors[]
   status         current | settled | stale
-  url            the exhibit, or `markdown` for a report that needs no page
+  url            the exhibit, or `markdown` and/or `figures[]` (as maps) for a
+                 report that needs no page of its own
   path           docs/analysis-artifacts/<file> when docky holds the written report
 
 records/adr-<stamp>-slug, records/chg-<stamp>-slug
@@ -138,6 +145,15 @@ URL forever**. Staleness is a bug.
 
 **Report:** a dated question and its answer. Immutable. Never refreshed; archived
 when the question is settled.
+
+**Inline map:** pictures that need no interactive page of their own -- a gallery
+of rendered assets, a set of screenshots -- live in the console itself. Publish the
+images as console files under `figures/<map-slug>/` (republish the `arty page`
+output with `files`; files left out are kept), and give the row `figures[]` instead
+of `url`. The row expands in place; a figure opens full size. Staleness works as for
+any map: refresh = regenerate the images, republish those files, update `commit`
+and `refreshed_at`. Anything with controls or claims is an exhibit, not an inline
+map.
 
 Choosing wrong is what produces redundancy: a new report where a map should have
 been refreshed. Before publishing anything, query `maps` and `reports` for the
