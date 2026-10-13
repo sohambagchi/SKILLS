@@ -9,6 +9,7 @@ Subcommands, no dependencies beyond the standard library:
             snapshot (git graph, features, the whole docky tree), recompute map
             staleness, and write a batch plan of the rows that changed
   snapshot  write the snapshot as one JSON file, for a local look at the page
+  due       say whether the console is behind the repository (a Stop hook)
   check     validate a console database dump against the schema
 
 Nothing here talks to claude.ai, and nothing here knows anything about a
@@ -576,6 +577,28 @@ def latest_head(rows):
     return max(heads, key=lambda r: r.get("generated_at") or "") if heads else None
 
 
+def docs_digest(root):
+    """What `due` compares: HEAD plus the working tree's docs, committed or not."""
+    h = hashlib.sha1()
+    h.update(git("rev-parse", "HEAD", check=False).encode())
+    for path in ["README.md"] + sorted(
+            os.path.relpath(os.path.join(d, f), root)
+            for d, _ds, fs in os.walk(os.path.join(root, "docs")) for f in fs if f.endswith(".md")):
+        full = os.path.join(root, path)
+        if os.path.isfile(full):
+            h.update(path.encode())
+            with open(full, "rb") as fh:
+                h.update(fh.read())
+    return h.hexdigest()[:16]
+
+
+def synced_path():
+    gitdir = git("rev-parse", "--git-common-dir", check=False) or ".git"
+    return os.path.join(gitdir, "arty-synced")
+
+
+# ------------------------------------------------------------------- staleness
+
 def map_staleness(row, limit=5):
     """Commit range: what has touched this map's anchors since it was refreshed.
 
@@ -734,11 +757,15 @@ def cmd_sync(args):
                 notes.append("  %-6s maps/%s  (%s)" % ("skip", mid, note))
         if (patch or row).get("status") == "stale":
             deviations.append(("stale", "maps/%s: %s" % (mid, note),
-                               "refresh the exhibit and re-anchor it, or retire it (arty SKILL.md section 7)"))
+                               "refresh the exhibit and re-anchor it, or retire it (arty SKILL.md section 8)"))
     for pid, row in sorted(rows.get("proposals", {}).items()):
         if row.get("status") == "answered":
             deviations.append(("pickup", "proposals/%s answered %r" % (pid, (row.get("answer") or {}).get("choice")),
                                "implement it, ADR it with docky, flip the row to accepted (arty SKILL.md section 5)"))
+
+    with open(synced_path(), "w") as fh:
+        json.dump({"digest": docs_digest(root), "snapshot": snap["id"], "at": now()}, fh)
+        fh.write("\n")
 
     print("plan: %d write%s, %d row%s unchanged" % (
         len(plan), "" if len(plan) == 1 else "s", quiet, "" if quiet == 1 else "s"))
@@ -780,6 +807,44 @@ def split_batches(plan):
     if cur:
         batches.append(cur)
     return batches
+
+
+def cmd_due(args):
+    """Exit 0 and say nothing when the console is current or there is none.
+
+    With --hook, speaks the Claude Code Stop-hook protocol: block once with a
+    reason when the repository moved since the last sync, never twice in a row.
+    """
+    root = git("rev-parse", "--show-toplevel", check=False)
+    if not root or not os.path.exists(os.path.join(root, POINTER)):
+        return
+    os.chdir(root)
+    if args.hook:
+        try:
+            event = json.load(sys.stdin)
+        except ValueError:
+            event = {}
+        if event.get("stop_hook_active"):
+            return
+    try:
+        with open(synced_path()) as fh:
+            last = json.load(fh).get("digest")
+    except (OSError, ValueError):
+        last = None
+    if last == docs_digest(root):
+        return
+    reason = ("The project console (%s) is behind this repository. Routine refresh, no judgement "
+              "needed: dump the console, run `arty sync`, write the batches it prints in order "
+              "(arty SKILL.md section 6). Act only on the deviations sync lists."
+              % read_pointer(root).get("console", ".arty"))
+    found = doc_deviations(root, snap_docs(root))
+    if found:
+        reason += " Already visible in docs/: " + "; ".join("%s (%s)" % (d["msg"], d["fix"]) for d in found) + "."
+    if args.hook:
+        print(json.dumps({"decision": "block", "reason": reason}))
+    else:
+        print(reason)
+        sys.exit(1)
 
 
 def cmd_brief(args):
@@ -1005,6 +1070,9 @@ def main(argv=None):
     p.add_argument("-n", type=int, default=1, help="how many, newest first (default 1)")
     p.set_defaults(fn=cmd_brief)
 
+    p = sub.add_parser("due", help="is the console behind the repository? (exit 1 if so)")
+    p.add_argument("--hook", action="store_true", help="speak the Claude Code Stop-hook protocol")
+    p.set_defaults(fn=cmd_due)
 
     p = sub.add_parser("check", help="validate a database dump against the schema")
     p.add_argument("--db", required=True, help="a read_db out_dir dump of the console")

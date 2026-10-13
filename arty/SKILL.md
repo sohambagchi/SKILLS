@@ -199,7 +199,8 @@ question stopped mattering. Never silently delete a proposal the user answered.
 ## 6. Refresh: routine sync, then deviations
 
 Refresh the console **at the end of any session that committed or changed
-`docs/`**, and whenever arty is used. The routine part needs no judgement — run it as written:
+`docs/`**, and whenever arty is used. The Stop hook (section 7) holds a session
+that forgets. The routine part needs no judgement — run it as written:
 
 ```
 read_db  db_op=list  collection=<proposals|maps|reports>  out_dir=$DUMP
@@ -223,7 +224,8 @@ that row; the dumped files don't carry it.
 Sync builds the snapshot from git and the working tree's `docs/` (briefings
 included), splits it into parts, recomputes each map's staleness as `git log
 <commit>..HEAD -- <anchors>` (so the page can name the commits that may have
-invalidated it). It merges, never replaces: authored fields survive.
+invalidated it), and records in `.git/arty-synced` what it saw, which is what
+`arty due` compares against. It merges, never replaces: authored fields survive.
 The page reads the newest head whose parts have all arrived, so it never assembles
 half a snapshot.
 
@@ -233,7 +235,7 @@ once the batches are written. Otherwise each line names what is off and the fix:
 | Deviation | Fix |
 |---|---|
 | `pickup` an answered proposal | implement it, ADR it with docky, flip it to `accepted` (section 5) |
-| `stale` a map whose anchors moved | refresh the exhibit and re-anchor it, or retire it (section 7) |
+| `stale` a map whose anchors moved | refresh the exhibit and re-anchor it, or retire it (section 8) |
 | `docs` 15+ commits since the last changelog | write the changelog with docky — it is the briefing |
 | `docs` ticked items in `TODO.md` | remove them (docky); the changelog records completion |
 | `docs` a TODO or INDEX link to a missing file | repoint it or drop the line (docky) |
@@ -250,7 +252,21 @@ against the `maps` and `reports` rows. A published artifact with no row is
 invisible to the next session — register or delete it. A row whose artifact is gone
 is retired.
 
-## 7. Exhibits — maps and reports
+## 7. The Stop hook
+
+`arty due --hook` makes the refresh hard to forget. It is silent in a repository
+without `.arty`, and silent when HEAD and `docs/` match the last sync. Otherwise it
+blocks the session's stop once, never twice in a row, with a reason that asks for
+the routine refresh and names any `docs` deviations it can already see.
+Installed once, in the user's Claude Code settings:
+
+```json
+{"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "~/.claude/skills/arty/arty due --hook"}]}]}}
+```
+
+Without the hook, `arty due` prints the same reason and exits 1, for any agent.
+
+## 8. Exhibits — maps and reports
 
 **Map:** a live picture of how something in the code is — architecture, data flow,
 performance, state of a migration. One per concern, **updated in place at its own
@@ -314,7 +330,7 @@ time, sequence, state change, cause -- and leave it alone when it doesn't.
   for structure you want to label, hit-test and theme. Both honour
   `prefers-reduced-motion`: at zero duration every state must still be reachable.
 
-## 8. Archive and ceilings
+## 9. Archive and ceilings
 
 - Archive by flipping `status` (`retired`, `settled`, `superseded`), never by
   deleting a row. Unpin the artifact. Delete an artifact only when the user says so.
@@ -324,7 +340,7 @@ time, sequence, state change, cause -- and leave it alone when it doesn't.
 - A stale map is refreshed or demoted to a dated report. It is never left stale
   with a fresh-looking page.
 
-## 9. Boundaries
+## 10. Boundaries
 
 - **docky** owns the repository's `docs/` tree and the format of every ADR and
   changelog. arty shows those files on the console and writes nothing under
@@ -337,7 +353,7 @@ time, sequence, state change, cause -- and leave it alone when it doesn't.
 - A project whose own rules forbid a `docs/` tree has no durable home for a decision.
   Say so when accepting a proposal there — don't invent a file the project disallows.
 
-## 10. Commands
+## 11. Commands
 
 `arty` (this directory, Python 3, standard library only, no dependencies). The page
 source is `console.html` beside it.
@@ -349,6 +365,7 @@ arty sync      --db DUMP --plan DIR [--force]          # snapshot + staleness ->
 arty check     --db DUMP                               # schema, ceilings, dangling anchors
 arty brief     [-n N]                                  # the briefing(s) the console shows, in a terminal
 arty snapshot  --out FILE                              # the snapshot as one JSON file
+arty due       [--hook]                                # is the console behind? (Stop hook)
 ```
 
 For a local look at the page without claude.ai, put `arty page` output and
