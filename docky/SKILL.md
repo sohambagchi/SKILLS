@@ -53,7 +53,7 @@ ADRs are immutable apart from `Status`. To change a decision, write a new ADR an
 
 ## Changelogs — `docs/changelog/`
 
-One file per coherent change set (feature, fix, refactor, session of work). Say what changed, not why. If an ADR covers the reasoning, the entry is just a pointer.
+One file per coherent change set (feature, fix, refactor, session of work). Say what changed, not why. If an ADR covers the reasoning, the entry is just a pointer. Lead with outcomes ("the slice is playable end to end", not "worked on the slice"): where an arty console exists, the newest changelog is its briefing.
 
 ```markdown
 # <Change title>
@@ -70,9 +70,11 @@ One file per coherent change set (feature, fix, refactor, session of work). Say 
 
 - [ ] <task, one line>
 - [ ] <task> — details: [<file>](todo/<file>)
+- [ ] <task> — blocked: <what or who it waits on>
 ```
 
 - Remove finished tasks. The changelog records completion, so don't keep checked items.
+- Mark a task that can't move with `— blocked: <on what>` at the end of its line, and drop the marker when it unblocks.
 - Only create a `docs/todo/<timestamp>-<slug>.md` file if the task can't be captured in a few lines (multi-step plan, specs, repro steps). Default to no detail file.
 - Delete a detail file when its task is done. Move any decision it contains into an ADR first.
 
