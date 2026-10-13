@@ -160,6 +160,31 @@ After touching a map, update its console row: `commit` to current HEAD,
 
 Follow **artifact-design** for the page and **dataviz** for anything plotted.
 
+### Motion and visualization
+
+An exhibit is a review instrument, so prefer a visualization to a description, and a
+control to a picture. Reach for motion when it carries what a static frame cannot --
+time, sequence, state change, cause -- and leave it alone when it doesn't.
+
+- **Show the mechanism, not the shape.** A lock-free algorithm wants an interleaving
+  you can step through; a pipeline wants one packet you can follow; a regression wants
+  both traces on one scale. Boxes and arrows are the fallback, not the goal.
+- **Scrub, step, toggle -- don't loop.** Understanding needs a control: a step button,
+  a timeline slider, a variant switch, a hover that reveals what connects. Animation
+  that plays by itself is a video, and nobody can ask a video a question. One ambient
+  motion per page, to mark something live, is the exception.
+- **Drive it from the rows.** The visualization reads the same `claims` rows the legend
+  does, so an unverified path still looks unverified while it moves. Never hard-code a
+  state the database owns, and never animate a claim into looking settled.
+- **Open at rest, and at a frame worth seeing.** The first paint is the whole story at
+  t = 0 -- nothing parked at `opacity: 0` waiting on a scroll, and the control already
+  at a position that shows what the exhibit is for.
+- **Measured numbers carry their provenance.** A chart's figures name the run they came
+  from; a number with no source doesn't go on the page.
+- Canvas or WebGL for thousands of marks, generative work, or anything per-frame; SVG
+  for structure you want to label, hit-test and theme. Both honour
+  `prefers-reduced-motion`: at zero duration every state must still be reachable.
+
 ## 6. Sync and audit
 
 Run a sync whenever arty is used:
