@@ -85,11 +85,15 @@ Not a dumping ground. Don't file incidental findings here — a debugging note o
 - Timestamped filename, same format as ADRs and changelogs.
 - Lead with the question asked and the answer. Findings before evidence.
 - Decisions that come out of a report go in an ADR; the report is a pointer's worth of context, not the decision record.
-- For an analysis published as an artifact on claude.ai, keep a markdown copy here with the artifact URL on the first line.
+- For an analysis published as a page on claude.ai, keep the question, the answer and the
+  artifact URL here, and nothing else — the page is registered as an exhibit by **arty**.
+  Don't mirror the page's content into this directory.
 - Reports worth returning to get a line in `INDEX.md` under `## Analysis`.
 - Prunable and stale-able like any other doc: whenever docky runs, drop reports whose question is settled and no longer referenced, and move ones the code has outgrown to `docs/stale/`.
 
 ## Index — `docs/INDEX.md`
+
+If the project has a console (a tracked `.arty` pointer), its link is the first line of the file.
 
 One line per entry: link plus a short phrase. Most files never appear here — only the ones that shaped the project (architecture, major features, breaking changes) or that a reader would go looking for. Prune links that are no longer significant.
 
