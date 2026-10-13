@@ -53,3 +53,15 @@ done
 ```
 
 For a single project, use the project-level directory instead (`.claude/skills/`, `.pi/skills/`, `.agents/skills/`, `.opencode/skills/`).
+
+### Second Claude Code login
+
+`claudia.sh` adds a `claudia` alias (bash, zsh, fish) that runs `claude` with its own config directory, `~/.claudia`, so a second account stays logged in alongside the first. Rerunning it is safe, and `--uninstall` removes the alias.
+
+```sh
+sh ~/dev/SKILLS/claudia.sh
+# or, without a clone:
+curl -fsSL https://raw.githubusercontent.com/sohambagchi/SKILLS/main/claudia.sh | sh
+```
+
+Then open a new shell, run `claudia`, and `/login`. Set `CLAUDIA_DIR` to use a different directory. Skills symlinked into `~/.claude/skills/` aren't visible to `claudia`, so symlink them into `~/.claudia/skills/` as well.
