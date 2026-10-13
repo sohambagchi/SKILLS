@@ -1,0 +1,1314 @@
+#!/usr/bin/env python3
+"""arty: reference tooling for the project console.
+
+Four subcommands, no dependencies beyond the standard library:
+
+  init    write the .arty pointer and the meta/project seed for a new console
+  page    emit the console HTML on stdout, for the agent to publish
+  sync    reconcile a console database dump against git -- project the ADR and
+          changelog files into records, recompute map staleness over the commit
+          range -- and write a batch plan of the rows that changed
+  check   validate a console database dump against the schema
+
+Nothing here talks to claude.ai, and nothing here knows anything about a
+particular project. The agent carries the rows (read_db --out_dir in, write_db
+batch out); this script owns git, the schema and the page. Every
+project-specific fact lives in the database.
+
+If this script ever needs to test a project by name, the schema is
+underspecified -- fix the schema, not this file.
+
+See SKILL.md for the schema itself; section references below point into it.
+"""
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+
+SCHEMA = 1
+POINTER = ".arty"
+
+KINDS = ("proposals", "maps", "reports", "records")
+PROPOSAL_STATUS = ("open", "answered", "accepted", "withdrawn", "superseded")
+MAP_STATUS = ("current", "stale", "retired")
+REPORT_STATUS = ("current", "settled", "stale")
+CLAIM_STATUS = ("verified", "unverified", "partial", "planned")
+URGENCY = ("blocking", "soon", "whenever")
+
+# Ceilings. Not errors: the point is that growth forces a merge or an archive
+# rather than an ever-longer index (SKILL.md section 7).
+MAX_OPEN_PROPOSALS = 6
+MAX_LIVE_MAPS = 12
+BLOCKING_AGE_DAYS = 7
+
+DOCKY = {"adr": "docs/adr", "changelog": "docs/changelog"}
+STALE_DIR = "docs/stale"
+STAMP = re.compile(r"^(\d{4}-\d{2}-\d{2})-(\d{4})-([a-z0-9][a-z0-9-]*)\.md$")
+ID = {
+    "proposals": re.compile(r"^p-\d{8}-\d{4}-[a-z0-9][a-z0-9-]*$"),
+    "maps": re.compile(r"^m-[a-z0-9][a-z0-9-]*$"),
+    "reports": re.compile(r"^r-\d{8}-[a-z0-9][a-z0-9-]*$"),
+    "records": re.compile(r"^(adr|chg)-\d{4}-\d{2}-\d{2}-\d{4}-[a-z0-9][a-z0-9-]*$"),
+}
+URL = re.compile(r"^https://claude\.ai/artifact/[A-Za-z0-9]+$")
+
+
+# ---------------------------------------------------------------- shell + files
+
+def git(*args, check=True):
+    """Run git in the repo root. Returns stdout, stripped."""
+    p = subprocess.run(("git",) + args, capture_output=True, text=True)
+    if check and p.returncode != 0:
+        die("git %s: %s" % (" ".join(args), p.stderr.strip()))
+    return p.stdout.strip()
+
+
+def die(msg):
+    sys.stderr.write("arty: %s\n" % msg)
+    sys.exit(2)
+
+
+def repo_root():
+    root = git("rev-parse", "--show-toplevel")
+    if not root:
+        die("not a git repository")
+    return root
+
+
+def now():
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+
+
+def read_pointer(root):
+    """Parse .arty -- `key = value` lines, blank lines and # comments ignored."""
+    path = os.path.join(root, POINTER)
+    if not os.path.exists(path):
+        return {}
+    out = {}
+    with open(path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            k, v = line.split("=", 1)
+            out[k.strip()] = v.strip()
+    return out
+
+
+def load_dump(path):
+    """Load a read_db --out_dir tree: <dump>/<collection>/<doc_id>.json.
+
+    Returns {collection: {doc_id: body}}. A `version` field in a body is kept
+    out of the row and handed back separately so writes can be pinned.
+    """
+    rows, versions = {}, {}
+    if not os.path.isdir(path):
+        die("no such dump directory: %s (read_db with out_dir first)" % path)
+    for dirpath, _dirnames, filenames in os.walk(path):
+        rel = os.path.relpath(dirpath, path)
+        collection = "" if rel == "." else rel.replace(os.sep, "/")
+        for name in sorted(filenames):
+            if not name.endswith(".json"):
+                continue
+            with open(os.path.join(dirpath, name)) as fh:
+                try:
+                    body = json.load(fh)
+                except json.JSONDecodeError as exc:
+                    die("%s/%s: %s" % (collection, name, exc))
+            doc = name[:-5]
+            if not isinstance(body, dict):
+                die("%s/%s: expected an object" % (collection, doc))
+            ver = body.pop("version", None) or body.pop("__version", None)
+            if isinstance(ver, int):
+                versions.setdefault(collection, {})[doc] = ver
+            rows.setdefault(collection, {})[doc] = body
+    return rows, versions
+
+
+# ------------------------------------------------------------- docky projection
+
+def first_line(text, prefix):
+    for line in text.splitlines():
+        if line.startswith(prefix):
+            return line[len(prefix):].strip()
+    return ""
+
+
+def one_line(text, limit=160):
+    text = re.sub(r"\s+", " ", text).strip()
+    text = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", text)  # links to their text
+    return text[: limit - 1] + "…" if len(text) > limit else text
+
+
+def record_id(kind, date, hhmm, slug):
+    return "%s-%s-%s-%s" % ("adr" if kind == "adr" else "chg", date, hhmm, slug)
+
+
+def read_record(path, kind, status=None):
+    """Derive one record row from a docky file. Derived fields only."""
+    with open(path) as fh:
+        text = fh.read()
+    title = first_line(text, "# ")
+    if kind == "adr":
+        raw = first_line(text, "**Status:**").lower()
+        status = status or ("superseded" if "superseded" in raw else (raw.split()[0] if raw else "accepted"))
+        summary = first_line(text, "**Decision:**") or first_line(text, "**Context:**")
+    else:
+        status = status or "accepted"
+        summary = ""
+    if not summary:
+        for line in text.splitlines():
+            if line.startswith("- "):
+                summary = line[2:]
+                break
+    return {
+        "kind": "adr" if kind == "adr" else "changelog",
+        "title": one_line(title, 90),
+        "status": status,
+        "summary": one_line(summary),
+        "schema": SCHEMA,
+    }
+
+
+def scan_docky(root):
+    """Project docs/adr and docs/changelog into desired `records` rows.
+
+    Derived fields only. Whatever the agent added to a row -- the proposal it
+    came from, the exhibits that argued it -- is never computed here, so sync
+    merges and never replaces (SKILL.md section 6).
+    """
+    want = {}
+
+    def take(directory, name, kind, status=None):
+        m = STAMP.match(name)
+        if not m:
+            return
+        date, hhmm, slug = m.groups()
+        rid = record_id(kind, date, hhmm, slug)
+        if rid in want:
+            return  # a live file always beats a copy under docs/stale/
+        row = read_record(os.path.join(root, directory, name), kind, status)
+        row["date"] = date
+        row["time"] = "%s:%s" % (hhmm[:2], hhmm[2:])
+        row["path"] = "%s/%s" % (directory, name)
+        want[rid] = row
+
+    for kind, rel in DOCKY.items():
+        directory = os.path.join(root, rel)
+        if os.path.isdir(directory):
+            for name in sorted(os.listdir(directory)):
+                take(rel, name, kind)
+
+    # docs/stale/ holds both kinds, so the kind comes from the file: docky's ADR
+    # template is the only one with a Status line.
+    directory = os.path.join(root, STALE_DIR)
+    if os.path.isdir(directory):
+        for name in sorted(os.listdir(directory)):
+            if not STAMP.match(name):
+                continue
+            with open(os.path.join(directory, name)) as fh:
+                head = fh.read(4096)
+            take(STALE_DIR, name, "adr" if "**Status:**" in head else "changelog", status="stale")
+
+    return want
+
+
+# ------------------------------------------------------------------- staleness
+
+def map_staleness(row, limit=5):
+    """Commit range: what has touched this map's anchors since it was refreshed.
+
+    Returns (patch, note). The commit range is the signal the user chose over a
+    content digest precisely because it can name the commits, so the page can
+    show which ones may have invalidated the map.
+    """
+    anchors = [a for a in row.get("anchors", []) if isinstance(a, str) and a]
+    commit = row.get("commit")
+    if row.get("status") == "retired":
+        return {}, "retired"
+    if not anchors:
+        return {}, "no anchors - cannot check"
+    if not commit:
+        return {}, "no commit - register a refresh first"
+    if git("cat-file", "-t", commit, check=False) != "commit":
+        return {}, "commit %s is not in this repository" % commit[:9]
+    tracked = git("ls-files", "--", *anchors)
+    if not tracked:
+        return {}, "anchors match no tracked file"
+    log = git("log", "--format=%h\t%s", "%s..HEAD" % commit, "--", *anchors)
+    lines = [l for l in log.splitlines() if l.strip()]
+    patch = {"checked_at": now(), "checked_at_commit": git("rev-parse", "--short", "HEAD")}
+    if lines:
+        patch["status"] = "stale"
+        patch["invalidated_count"] = len(lines)
+        patch["invalidated_by"] = [
+            {"commit": l.split("\t")[0], "subject": one_line(l.split("\t", 1)[1], 90)}
+            for l in lines[:limit]
+        ]
+        return patch, "stale: %d commit%s since %s" % (
+            len(lines), "" if len(lines) == 1 else "s", commit[:9])
+    patch["status"] = "current"
+    patch["invalidated_count"] = 0
+    patch["invalidated_by"] = []
+    return patch, "current"
+
+
+def changed(old, new):
+    """Fields of `new` that `old` does not already carry, compared as JSON."""
+    out = {}
+    for k, v in new.items():
+        if json.dumps(old.get(k), sort_keys=True) != json.dumps(v, sort_keys=True):
+            out[k] = v
+    return out
+
+
+# ----------------------------------------------------------------- subcommands
+
+def cmd_init(args):
+    root = repo_root()
+    if not URL.match(args.url):
+        die("not an artifact url: %s" % args.url)
+    name = args.name or os.path.basename(root)
+    pointer = os.path.join(root, POINTER)
+    with open(pointer, "w") as fh:
+        fh.write("# The project console. Live state lives there, not here.\n")
+        fh.write("console = %s\n" % args.url)
+        fh.write("project = %s\n" % name)
+        fh.write("schema = %d\n" % SCHEMA)
+    remote = git("remote", "get-url", "origin", check=False)
+    seed = {
+        "project": name,
+        "schema": SCHEMA,
+        "remote": remote or None,
+        "created": now(),
+        "head": git("rev-parse", "--short", "HEAD"),
+    }
+    out = args.seed or os.path.join(root, POINTER + ".seed.json")
+    if os.path.dirname(out):
+        os.makedirs(os.path.dirname(out), exist_ok=True)
+    with open(out, "w") as fh:
+        json.dump(seed, fh, indent=2, sort_keys=True)
+        fh.write("\n")
+    print("wrote %s" % os.path.relpath(pointer, root))
+    print("seed %s -> write_db set meta/project" % out)
+
+
+def cmd_page(args):
+    """The page is generic. --project only names it; every other fact is a row."""
+    if args.project:
+        sys.stdout.write("<title>%s Console</title>\n" % args.project)
+    sys.stdout.write(CONSOLE_HTML)
+
+
+def cmd_sync(args):
+    root = repo_root()
+    os.chdir(root)
+    rows, versions = load_dump(args.db)
+    plan, notes, quiet = [], [], 0
+
+    def entry(op, collection, doc, body, note):
+        path = os.path.join(args.plan, collection)
+        os.makedirs(path, exist_ok=True)
+        path = os.path.join(path, doc + ".json")
+        with open(path, "w") as fh:
+            json.dump(body, fh, indent=2, sort_keys=True)
+            fh.write("\n")
+        item = {"op": op, "collection": collection, "doc_id": doc, "file_path": path}
+        ver = versions.get(collection, {}).get(doc)
+        if ver and op == "update":
+            item["if_version"] = ver
+        plan.append(item)
+        notes.append("  %-6s %s/%s  (%s)" % (op, collection, doc, note))
+
+    have = rows.get("records", {})
+    want = scan_docky(root)
+    for rid, body in sorted(want.items()):
+        if rid not in have:
+            entry("set", "records", rid, body, "new %s" % body["kind"])
+            continue
+        delta = changed(have[rid], body)
+        if delta:
+            entry("update", "records", rid, delta, ", ".join(sorted(delta)))
+        else:
+            quiet += 1
+    for rid, body in sorted(have.items()):
+        if rid not in want and body.get("status") != "missing":
+            entry("update", "records", rid, {"status": "missing"}, "file is gone")
+
+    for mid, row in sorted(rows.get("maps", {}).items()):
+        patch, note = map_staleness(row)
+        delta = changed(row, patch) if patch else {}
+        if delta:
+            entry("update", "maps", mid, delta, note)
+        else:
+            quiet += 1
+            if not patch:
+                notes.append("  %-6s maps/%s  (%s)" % ("skip", mid, note))
+
+    print("plan: %d write%s, %d row%s unchanged" % (
+        len(plan), "" if len(plan) == 1 else "s", quiet, "" if quiet == 1 else "s"))
+    for line in notes:
+        print(line)
+    if plan:
+        print("\nwrites:")
+        for item in plan:
+            print("  " + json.dumps(item, sort_keys=True))
+
+
+def cmd_check(args):
+    root = repo_root()
+    os.chdir(root)
+    rows, _versions = load_dump(args.db)
+    errors, warnings = [], []
+
+    def err(where, msg):
+        errors.append("%s: %s" % (where, msg))
+
+    def warn(where, msg):
+        warnings.append("%s: %s" % (where, msg))
+
+    meta = rows.get("meta", {}).get("project")
+    if not meta:
+        err("meta/project", "missing -- run arty init and seed it")
+    elif meta.get("schema") != SCHEMA:
+        err("meta/project", "schema %r, this arty speaks %d" % (meta.get("schema"), SCHEMA))
+
+    for collection in rows:
+        if collection not in KINDS and collection != "meta":
+            warn(collection, "not a collection this schema knows")
+
+    seen_urls = {}
+    for collection in KINDS:
+        for doc, row in sorted(rows.get(collection, {}).items()):
+            where = "%s/%s" % (collection, doc)
+            if not ID[collection].match(doc):
+                err(where, "id does not match %s" % ID[collection].pattern)
+            url = row.get("url")
+            if url is not None:
+                if not URL.match(str(url)):
+                    err(where, "url %r is not an artifact url" % url)
+                elif url in seen_urls:
+                    err(where, "same exhibit as %s -- one artifact, one row" % seen_urls[url])
+                else:
+                    seen_urls[url] = where
+            for anchor in row.get("anchors", []) or []:
+                if not git("ls-files", "--", anchor):
+                    warn(where, "anchor %r matches no tracked file" % anchor)
+
+    for doc, row in sorted(rows.get("proposals", {}).items()):
+        where = "proposals/%s" % doc
+        status = row.get("status")
+        if status not in PROPOSAL_STATUS:
+            err(where, "status %r not in %s" % (status, "|".join(PROPOSAL_STATUS)))
+        for field in ("title", "question", "assumption"):
+            if not row.get(field):
+                err(where, "no %s" % field)
+        if row.get("urgency") not in URGENCY:
+            err(where, "urgency %r not in %s" % (row.get("urgency"), "|".join(URGENCY)))
+        options = row.get("options") or []
+        if status in ("open", "answered") and len(options) < 2:
+            err(where, "%d option(s) -- a proposal offers at least two" % len(options))
+        keys = [o.get("key") for o in options if isinstance(o, dict)]
+        if len(set(keys)) != len(keys):
+            err(where, "duplicate option keys")
+        if status == "answered":
+            choice = (row.get("answer") or {}).get("choice")
+            if not choice:
+                err(where, "answered with no answer.choice")
+            elif choice not in keys:
+                err(where, "answer.choice %r is not one of %s" % (choice, keys))
+        if status == "accepted" and not (row.get("outcome") or {}).get("adr"):
+            warn(where, "accepted without an ADR -- the decision has no durable home")
+        if status == "open" and row.get("urgency") == "blocking":
+            asked = str(row.get("asked_at", ""))[:10]
+            try:
+                age = (time.time() - time.mktime(time.strptime(asked, "%Y-%m-%d"))) / 86400
+            except ValueError:
+                age = 0
+            if age > BLOCKING_AGE_DAYS:
+                warn(where, "blocking and %d days old" % age)
+
+    for doc, row in sorted(rows.get("maps", {}).items()):
+        where = "maps/%s" % doc
+        if row.get("status") not in MAP_STATUS:
+            err(where, "status %r not in %s" % (row.get("status"), "|".join(MAP_STATUS)))
+        for field in ("title", "purpose", "url"):
+            if not row.get(field):
+                err(where, "no %s" % field)
+        if row.get("status") != "retired" and not row.get("anchors"):
+            err(where, "no anchors -- nothing to go stale against")
+        claims = row.get("claims") or {}
+        for key in claims:
+            if key not in CLAIM_STATUS:
+                err(where, "claims.%s is not one of %s" % (key, "|".join(CLAIM_STATUS)))
+
+    for doc, row in sorted(rows.get("reports", {}).items()):
+        where = "reports/%s" % doc
+        if row.get("status") not in REPORT_STATUS:
+            err(where, "status %r not in %s" % (row.get("status"), "|".join(REPORT_STATUS)))
+        for field in ("title", "question"):
+            if not row.get(field):
+                err(where, "no %s" % field)
+        if not row.get("url") and not row.get("markdown"):
+            err(where, "neither an exhibit url nor inline markdown")
+
+    for doc, row in sorted(rows.get("records", {}).items()):
+        where = "records/%s" % doc
+        if row.get("kind") not in ("adr", "changelog"):
+            err(where, "kind %r is not adr|changelog" % row.get("kind"))
+        if not row.get("path"):
+            err(where, "no path -- a record points at a file in git")
+        elif row.get("status") != "missing" and not os.path.exists(row["path"]):
+            warn(where, "path %s does not exist" % row["path"])
+
+    live_maps = [d for d, r in rows.get("maps", {}).items() if r.get("status") != "retired"]
+    if len(live_maps) > MAX_LIVE_MAPS:
+        warn("maps", "%d live -- ceiling is %d; merge or archive" % (len(live_maps), MAX_LIVE_MAPS))
+    open_proposals = [d for d, r in rows.get("proposals", {}).items() if r.get("status") == "open"]
+    if len(open_proposals) > MAX_OPEN_PROPOSALS:
+        warn("proposals", "%d open -- ceiling is %d; the inbox is a queue, not a backlog"
+             % (len(open_proposals), MAX_OPEN_PROPOSALS))
+
+    counts = ", ".join("%d %s" % (len(rows.get(k, {})), k) for k in KINDS)
+    print("checked: %s" % counts)
+    waiting = [d for d, r in rows.get("proposals", {}).items() if r.get("status") == "answered"]
+    if waiting:
+        print("pickup %d answered proposal%s: %s"
+              % (len(waiting), "" if len(waiting) == 1 else "s", ", ".join(sorted(waiting))))
+    stale = [d for d, r in rows.get("maps", {}).items() if r.get("status") == "stale"]
+    if stale:
+        print("stale  %d map%s: %s" % (len(stale), "" if len(stale) == 1 else "s", ", ".join(sorted(stale))))
+    for line in warnings:
+        print("warn  %s" % line)
+    for line in errors:
+        print("error %s" % line)
+    if errors:
+        sys.exit(1)
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="arty", description=__doc__.splitlines()[0])
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p = sub.add_parser("init", help="write the .arty pointer and the meta/project seed")
+    p.add_argument("--url", required=True, help="the console artifact's url")
+    p.add_argument("--name", help="project name (default: the repository directory)")
+    p.add_argument("--seed", help="where to write the meta/project body")
+    p.set_defaults(fn=cmd_init)
+
+    p = sub.add_parser("page", help="emit the console HTML on stdout")
+    p.add_argument("--project", help="name the page (the db still wins once it answers)")
+    p.set_defaults(fn=cmd_page)
+
+    p = sub.add_parser("sync", help="reconcile a database dump against git")
+    p.add_argument("--db", required=True, help="a read_db out_dir dump of the console")
+    p.add_argument("--plan", required=True, help="directory to write the batch bodies into")
+    p.set_defaults(fn=cmd_sync)
+
+    p = sub.add_parser("check", help="validate a database dump against the schema")
+    p.add_argument("--db", required=True, help="a read_db out_dir dump of the console")
+    p.set_defaults(fn=cmd_check)
+
+    args = ap.parse_args(argv)
+    args.fn(args)
+
+
+CONSOLE_HTML = r"""<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,300..800&family=Newsreader:ital,opsz,wght@0,6..72,300..700;1,6..72,300..700&family=Fira+Code:wght@300..700&display=swap">
+<style>
+/* Sobar — values ported from the design system's tokens, not re-derived. */
+:root{
+--paper-50:oklch(0.988 0.006 82);--paper-100:oklch(0.968 0.013 82);--paper-200:oklch(0.935 0.019 80);--paper-300:oklch(0.885 0.024 78);
+--stone-400:oklch(0.735 0.024 72);--stone-500:oklch(0.585 0.024 66);--umber-600:oklch(0.465 0.024 60);--umber-700:oklch(0.355 0.021 56);
+--ink-800:oklch(0.265 0.017 52);--ink-900:oklch(0.195 0.013 50);--ink-950:oklch(0.155 0.010 50);
+--cinnabar-100:oklch(0.950 0.030 42);--cinnabar-200:oklch(0.885 0.068 40);--cinnabar-300:oklch(0.790 0.120 38);--cinnabar-400:oklch(0.690 0.170 36);
+--cinnabar-500:oklch(0.610 0.200 34);--cinnabar-600:oklch(0.540 0.190 32);--cinnabar-700:oklch(0.450 0.160 30);--cinnabar-900:oklch(0.300 0.095 30);
+--ochre-100:oklch(0.960 0.035 88);--ochre-200:oklch(0.910 0.075 86);--ochre-400:oklch(0.815 0.130 80);--ochre-500:oklch(0.735 0.140 74);--ochre-700:oklch(0.520 0.105 68);
+--verdigris-100:oklch(0.950 0.022 178);--verdigris-200:oklch(0.895 0.045 178);--verdigris-500:oklch(0.590 0.085 182);--verdigris-700:oklch(0.425 0.070 186);
+--lapis-100:oklch(0.950 0.022 262);--lapis-200:oklch(0.880 0.050 262);--lapis-500:oklch(0.520 0.130 264);--lapis-700:oklch(0.390 0.115 266);
+
+--bg-page:var(--paper-100);--bg-surface:var(--paper-50);--bg-sunken:var(--paper-200);--bg-inverse:var(--ink-900);
+--bg-accent:var(--cinnabar-500);--bg-accent-soft:var(--cinnabar-100);
+--fg-1:var(--ink-900);--fg-2:var(--umber-700);--fg-3:var(--stone-500);--fg-inverse:var(--paper-50);
+--fg-accent:var(--cinnabar-600);--fg-on-accent:var(--paper-50);
+--text-body:var(--fg-1);--text-muted:var(--fg-2);--text-subtle:var(--fg-3);
+--surface-card:var(--bg-surface);--surface-overlay:oklch(0.195 0.013 50 / 0.42);
+--line-1:oklch(0.195 0.013 50 / 0.12);--line-2:oklch(0.195 0.013 50 / 0.24);--line-strong:var(--ink-900);
+--accent:var(--cinnabar-600);--accent-hover:var(--cinnabar-700);--thread:var(--cinnabar-500);--focus-ring:var(--cinnabar-500);
+--selection:var(--ochre-200);
+--success:var(--verdigris-700);--success-soft:var(--verdigris-100);
+--warning:var(--ochre-700);--warning-soft:var(--ochre-100);
+--danger:var(--cinnabar-700);--danger-soft:var(--cinnabar-100);
+--info:var(--lapis-700);--info-soft:var(--lapis-100);
+--glass-bg:oklch(0.968 0.013 82 / 0.72);
+--shadow-1:0 1px 0 oklch(0.30 0.03 50 / 0.06),0 1px 3px oklch(0.30 0.03 50 / 0.06);
+--shadow-2:0 2px 4px oklch(0.30 0.03 50 / 0.05),0 10px 28px -6px oklch(0.30 0.03 50 / 0.14);
+--shadow-3:0 4px 8px oklch(0.30 0.03 50 / 0.06),0 28px 64px -12px oklch(0.25 0.03 50 / 0.28);
+--shadow-focus:0 0 0 2px var(--bg-page),0 0 0 4px var(--focus-ring);
+
+--font-display:"Bricolage Grotesque","Helvetica Neue",Arial,sans-serif;
+--font-serif:"Newsreader","Iowan Old Style",Georgia,serif;
+--font-mono:"Fira Code",ui-monospace,"SFMono-Regular",Menlo,monospace;
+--text-micro:11px;--text-xs:12px;--text-sm:14px;--text-base:16px;--text-read:19px;--text-md:21px;
+--text-lg:clamp(22px,1.6vw + 14px,28px);--text-xl:clamp(28px,2.4vw + 16px,40px);--text-2xl:clamp(36px,4vw + 16px,64px);
+--leading-solid:0.88;--leading-tight:1.02;--leading-snug:1.18;--leading-normal:1.45;--leading-read:1.62;
+--tracking-monument:-0.055em;--tracking-display:-0.035em;--tracking-tight:-0.015em;--tracking-caps:0.09em;
+--space-1:2px;--space-2:4px;--space-3:8px;--space-4:12px;--space-5:16px;--space-6:24px;--space-7:32px;--space-8:48px;--space-9:64px;
+--gutter:clamp(20px,4vw,56px);--page-max:1360px;--measure:64ch;
+--radius-sm:4px;--radius-md:8px;--radius-lg:16px;--radius-pill:999px;
+--hairline:1px;--rule:2px;
+--ease-drift:cubic-bezier(0.22,1,0.36,1);--ease-settle:cubic-bezier(0.34,1.36,0.64,1);
+--dur-instant:120ms;--dur-quick:200ms;--dur-base:320ms;--dur-slow:560ms;--dur-stagger:60ms;
+}
+/* Ink — the same system at night. Stamped and unstamped viewers both. */
+@media (prefers-color-scheme:dark){:root:not([data-theme="light"]){
+--bg-page:var(--ink-950);--bg-surface:var(--ink-900);--bg-sunken:oklch(0.125 0.008 50);--bg-inverse:var(--paper-100);
+--bg-accent-soft:oklch(0.30 0.07 32);
+--fg-1:var(--paper-100);--fg-2:var(--paper-300);--fg-3:var(--stone-400);--fg-inverse:var(--ink-900);--fg-accent:var(--cinnabar-400);
+--text-body:var(--fg-1);--text-muted:var(--fg-2);--text-subtle:var(--fg-3);
+--surface-card:var(--ink-900);--surface-overlay:oklch(0.10 0.008 50 / 0.6);
+--line-1:oklch(0.968 0.013 82 / 0.12);--line-2:oklch(0.968 0.013 82 / 0.24);--line-strong:var(--paper-100);
+--accent:var(--cinnabar-500);--accent-hover:var(--cinnabar-400);--thread:var(--cinnabar-400);--focus-ring:var(--cinnabar-400);
+--selection:oklch(0.45 0.09 70);
+--success:var(--verdigris-200);--success-soft:oklch(0.28 0.04 182);
+--warning:var(--ochre-400);--warning-soft:oklch(0.30 0.05 74);
+--danger:var(--cinnabar-300);--danger-soft:oklch(0.30 0.07 32);
+--info:var(--lapis-200);--info-soft:oklch(0.28 0.05 264);
+--glass-bg:oklch(0.155 0.010 50 / 0.7);
+--shadow-1:0 1px 0 oklch(0 0 0 / 0.3);--shadow-2:0 10px 28px -6px oklch(0 0 0 / 0.5);--shadow-3:0 28px 64px -12px oklch(0 0 0 / 0.7);
+}}
+:root[data-theme="dark"]{
+--bg-page:var(--ink-950);--bg-surface:var(--ink-900);--bg-sunken:oklch(0.125 0.008 50);--bg-inverse:var(--paper-100);
+--bg-accent-soft:oklch(0.30 0.07 32);
+--fg-1:var(--paper-100);--fg-2:var(--paper-300);--fg-3:var(--stone-400);--fg-inverse:var(--ink-900);--fg-accent:var(--cinnabar-400);
+--text-body:var(--fg-1);--text-muted:var(--fg-2);--text-subtle:var(--fg-3);
+--surface-card:var(--ink-900);--surface-overlay:oklch(0.10 0.008 50 / 0.6);
+--line-1:oklch(0.968 0.013 82 / 0.12);--line-2:oklch(0.968 0.013 82 / 0.24);--line-strong:var(--paper-100);
+--accent:var(--cinnabar-500);--accent-hover:var(--cinnabar-400);--thread:var(--cinnabar-400);--focus-ring:var(--cinnabar-400);
+--selection:oklch(0.45 0.09 70);
+--success:var(--verdigris-200);--success-soft:oklch(0.28 0.04 182);
+--warning:var(--ochre-400);--warning-soft:oklch(0.30 0.05 74);
+--danger:var(--cinnabar-300);--danger-soft:oklch(0.30 0.07 32);
+--info:var(--lapis-200);--info-soft:oklch(0.28 0.05 264);
+--glass-bg:oklch(0.155 0.010 50 / 0.7);
+--shadow-1:0 1px 0 oklch(0 0 0 / 0.3);--shadow-2:0 10px 28px -6px oklch(0 0 0 / 0.5);--shadow-3:0 28px 64px -12px oklch(0 0 0 / 0.7);
+}
+
+*,*::before,*::after{box-sizing:border-box}
+body{background:var(--bg-page);color:var(--text-body);font:400 var(--text-base)/1.45 var(--font-display);
+-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+::selection{background:var(--selection)}
+:focus-visible{outline:none;box-shadow:var(--shadow-focus);border-radius:var(--radius-sm)}
+h1,h2,h3,h4,p,ul,ol,figure{margin:0}
+ul{padding:0;list-style:none}
+a{color:inherit;text-decoration:none}
+
+.wrap{max-width:var(--page-max);margin:0 auto;padding-inline:var(--gutter)}
+
+/* —— header: the only fixed element —— */
+.hdr{position:sticky;top:0;z-index:20;background:var(--glass-bg);backdrop-filter:saturate(1.4) blur(14px);
+border-bottom:var(--hairline) solid var(--line-1)}
+.hdr__in{display:flex;align-items:baseline;gap:var(--space-7);flex-wrap:wrap;padding-block:var(--space-5)}
+.wordmark{font-family:var(--font-display);font-weight:800;font-size:var(--text-lg);letter-spacing:var(--tracking-monument);line-height:1}
+.wordmark .stop{color:var(--accent)}
+.stamp{margin-left:auto;font:var(--text-micro)/1.2 var(--font-mono);letter-spacing:var(--tracking-caps);
+text-transform:uppercase;color:var(--text-subtle);white-space:nowrap}
+
+/* —— tabs: line variant, indicator glides —— */
+.tabs{position:relative;display:flex;gap:var(--space-6);overflow-x:auto;scrollbar-width:none}
+.tabs::-webkit-scrollbar{display:none}
+.tab{appearance:none;background:none;border:0;padding:0 0 var(--space-3);cursor:pointer;white-space:nowrap;
+font-family:var(--font-display);font-weight:500;font-size:var(--text-sm);letter-spacing:var(--tracking-tight);
+color:var(--text-subtle);transition:color var(--dur-quick) var(--ease-drift)}
+.tab:hover{color:var(--text-body)}
+.tab[aria-selected="true"]{color:var(--text-body)}
+.tab__n{font-family:var(--font-mono);font-size:var(--text-micro);color:var(--text-subtle);margin-left:var(--space-2)}
+.tab[aria-selected="true"] .tab__n{color:var(--accent)}
+.tabs__ind{position:absolute;bottom:0;left:0;height:var(--rule);background:var(--thread);
+transition:transform var(--dur-base) var(--ease-drift),width var(--dur-base) var(--ease-drift);transform-origin:left}
+
+main{padding-block:var(--space-8) var(--space-9);display:block}
+.view[hidden]{display:none}
+.view{display:grid;gap:var(--space-6)}
+
+/* —— eyebrow / meta —— */
+.eyebrow{font:500 var(--text-micro)/1.2 var(--font-mono);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-subtle)}
+.meta{font:400 var(--text-xs)/1.4 var(--font-mono);color:var(--text-subtle)}
+.serif{font:400 var(--text-read)/var(--leading-read) var(--font-serif)}
+.voice{font:400 var(--text-md)/var(--leading-normal) var(--font-serif);font-style:italic;color:var(--text-muted)}
+
+/* —— badges —— */
+.badge{display:inline-flex;align-items:center;gap:var(--space-2);padding:3px var(--space-3);border-radius:var(--radius-sm);
+font:500 var(--text-micro)/1.2 var(--font-mono);letter-spacing:var(--tracking-caps);text-transform:uppercase;
+border:var(--hairline) solid var(--line-2);color:var(--text-muted);white-space:nowrap}
+.badge .dot{width:6px;height:6px;border-radius:var(--radius-pill);background:currentColor}
+.badge--accent{color:var(--fg-accent);border-color:color-mix(in oklab,var(--accent) 45%,transparent);background:var(--bg-accent-soft)}
+.badge--success{color:var(--success);border-color:color-mix(in oklab,var(--success) 40%,transparent);background:var(--success-soft)}
+.badge--warning{color:var(--warning);border-color:color-mix(in oklab,var(--warning) 40%,transparent);background:var(--warning-soft)}
+.badge--info{color:var(--info);border-color:color-mix(in oklab,var(--info) 40%,transparent);background:var(--info-soft)}
+.badge--danger{color:var(--danger);border-color:color-mix(in oklab,var(--danger) 45%,transparent);background:var(--danger-soft)}
+.badge--pulse .dot{animation:ln-pulse 2.4s var(--ease-settle) infinite}
+@keyframes ln-pulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+/* —— tags: anchors, and the relation reveal —— */
+.tags{display:flex;flex-wrap:wrap;gap:var(--space-2)}
+.tag{display:inline-block;padding:2px var(--space-3);border:var(--hairline) solid var(--line-2);border-radius:var(--radius-pill);
+font:400 var(--text-micro)/1.5 var(--font-mono);color:var(--text-muted);transition:border-color var(--dur-quick) var(--ease-drift)}
+.tag--related{border-color:var(--thread);color:var(--fg-accent)}
+
+/* —— cards: the inbox only —— */
+.card{position:relative;background:var(--surface-card);border:var(--hairline) solid var(--line-1);border-radius:var(--radius-md);
+padding:var(--space-6);display:grid;gap:var(--space-5);animation:ln-rise var(--dur-slow) var(--ease-drift) both}
+@keyframes ln-rise{from{opacity:0;transform:translateY(14px)}to{opacity:1;transform:none}}
+.card::before{content:"";position:absolute;inset:0 0 auto;height:var(--rule);background:var(--thread);border-radius:var(--radius-md) var(--radius-md) 0 0;
+transform:scaleX(0);transform-origin:left;transition:transform var(--dur-slow) var(--ease-drift)}
+.card--live::before{transform:scaleX(1)}
+.card__head{display:flex;align-items:center;gap:var(--space-4);flex-wrap:wrap}
+.card__title{font-family:var(--font-display);font-weight:600;font-size:var(--text-xl);line-height:var(--leading-tight);
+letter-spacing:var(--tracking-display);text-wrap:balance}
+.card__q{font:400 var(--text-read)/var(--leading-read) var(--font-serif);max-width:var(--measure)}
+.assume{display:flex;gap:var(--space-4);align-items:baseline;padding-left:var(--space-5);border-left:var(--rule) solid var(--line-2)}
+.assume__k{font:500 var(--text-micro)/1.6 var(--font-mono);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--text-subtle);white-space:nowrap}
+.assume__v{font:400 var(--text-base)/var(--leading-normal) var(--font-serif);font-style:italic;color:var(--text-muted)}
+
+/* —— options —— */
+.opts{display:grid;gap:var(--space-3);border-top:var(--hairline) solid var(--line-1);padding-top:var(--space-5)}
+.opt{display:grid;grid-template-columns:auto 1fr;gap:var(--space-4);padding:var(--space-4);border-radius:var(--radius-md);
+border:var(--hairline) solid transparent;cursor:pointer;transition:background var(--dur-quick) var(--ease-drift),border-color var(--dur-quick) var(--ease-drift)}
+.opt:hover{background:var(--bg-sunken)}
+.opt input{appearance:none;width:16px;height:16px;margin:4px 0 0;border:var(--hairline) solid var(--line-2);border-radius:var(--radius-pill);
+background:var(--bg-surface);cursor:pointer;transition:border-color var(--dur-quick) var(--ease-drift)}
+.opt input:checked{border-color:var(--accent);background:radial-gradient(circle at center,var(--accent) 0 3.5px,transparent 3.7px)}
+.opt:has(input:checked){border-color:var(--line-2);background:var(--bg-sunken)}
+.opt__label{font-family:var(--font-display);font-weight:600;font-size:var(--text-base);letter-spacing:var(--tracking-tight);
+display:flex;gap:var(--space-3);align-items:baseline;flex-wrap:wrap}
+.opt__sum{font:400 var(--text-base)/var(--leading-normal) var(--font-serif);color:var(--text-muted);margin-top:2px}
+.opt__trade{font:400 var(--text-xs)/1.5 var(--font-mono);color:var(--text-subtle);margin-top:var(--space-2)}
+.rec{font:500 var(--text-micro)/1.2 var(--font-mono);letter-spacing:var(--tracking-caps);text-transform:uppercase;color:var(--fg-accent)}
+
+/* —— controls —— */
+.field{display:grid;gap:var(--space-3)}
+textarea{width:100%;min-height:76px;resize:vertical;padding:var(--space-4);background:var(--bg-surface);color:var(--text-body);
+border:var(--hairline) solid var(--line-2);border-radius:var(--radius-md);font:400 var(--text-base)/var(--leading-normal) var(--font-serif)}
+textarea:focus{outline:none;border-color:var(--line-strong);box-shadow:0 0 0 3px color-mix(in oklab,var(--accent) 18%,transparent)}
+.actions{display:flex;gap:var(--space-4);align-items:center;flex-wrap:wrap}
+.btn{position:relative;overflow:hidden;appearance:none;cursor:pointer;display:inline-flex;align-items:center;gap:var(--space-3);
+height:40px;padding:0 var(--space-6);border-radius:var(--radius-pill);border:var(--hairline) solid var(--line-strong);
+background:var(--bg-inverse);color:var(--fg-inverse);font-family:var(--font-display);font-weight:600;font-size:var(--text-sm);
+letter-spacing:var(--tracking-tight);transition:transform var(--dur-instant) var(--ease-settle)}
+.btn::before{content:"";position:absolute;inset:0;background:var(--accent);transform:scaleX(0);transform-origin:left;
+transition:transform var(--dur-base) var(--ease-drift);z-index:0}
+.btn>*{position:relative;z-index:1}
+.btn:hover::before{transform:scaleX(1)}
+.btn:active{transform:scale(0.97)}
+.btn:disabled{opacity:.42;cursor:not-allowed}
+.btn--ghost{background:none;color:var(--text-body);border-color:transparent}
+.btn--ghost::before{display:none}
+.btn--ghost:hover{color:var(--fg-accent)}
+
+/* —— index rows: maps, reports —— */
+.index{border-top:var(--hairline) solid var(--line-1)}
+.row{position:relative;display:grid;grid-template-columns:auto 1fr auto;gap:var(--space-5);align-items:baseline;
+padding-block:var(--space-5);border-bottom:var(--hairline) solid var(--line-1);
+transition:opacity var(--dur-quick) var(--ease-drift)}
+.row::after{content:"";position:absolute;inset:auto 0 -1px;height:var(--rule);background:var(--thread);
+transform:scaleX(0);transform-origin:left;transition:transform var(--dur-slow) var(--ease-drift)}
+.row:hover::after,.row.is-related::after{transform:scaleX(1)}
+.row.is-dim{opacity:.35}
+.row__i{font:400 var(--text-xs)/1.6 var(--font-mono);color:var(--text-subtle);min-width:2.5ch}
+.row__main{display:grid;gap:var(--space-3);min-width:0}
+.row__t{font-family:var(--font-display);font-weight:600;font-size:var(--text-lg);line-height:var(--leading-snug);
+letter-spacing:var(--tracking-display);display:inline-flex;align-items:baseline;gap:var(--space-3);
+transition:transform var(--dur-base) var(--ease-drift)}
+.row:hover .row__t{transform:translateX(10px)}
+.row__t .ext{color:var(--text-subtle);font-size:var(--text-sm);transition:transform var(--dur-base) var(--ease-drift),color var(--dur-quick) var(--ease-drift)}
+.row:hover .row__t .ext{transform:translate(4px,-4px);color:var(--fg-accent)}
+.row__sub{font:400 var(--text-md)/var(--leading-normal) var(--font-serif);font-style:italic;color:var(--text-muted)}
+.row__side{display:grid;gap:var(--space-3);justify-items:end;text-align:right}
+.row__why{display:grid;gap:var(--space-1);padding-top:var(--space-2)}
+.row__why .commit{font:400 var(--text-xs)/1.6 var(--font-mono);color:var(--text-subtle)}
+.row__why .commit b{color:var(--fg-accent);font-weight:400}
+
+/* —— claim bar: four pigments, one scale —— */
+.claims{display:grid;gap:var(--space-3);min-width:168px}
+.bar{display:flex;height:var(--rule);background:var(--line-1);overflow:hidden}
+.bar span{display:block;height:100%}
+.bar .s-verified{background:var(--success)}
+.bar .s-partial{background:var(--warning)}
+.bar .s-unverified{background:var(--stone-400)}
+.bar .s-planned{background:var(--info)}
+.legend{display:flex;gap:var(--space-4);flex-wrap:wrap;font:400 var(--text-micro)/1.4 var(--font-mono);color:var(--text-subtle)}
+.legend i{display:inline-block;width:6px;height:6px;margin-right:4px;border-radius:var(--radius-pill);vertical-align:middle}
+
+/* —— timeline: one thread through the project —— */
+.tl{position:relative;display:grid;gap:var(--space-7);padding-left:var(--space-7)}
+.tl::before{content:"";position:absolute;left:5px;top:6px;bottom:6px;width:var(--hairline);background:var(--line-2)}
+.tl__item{position:relative;display:grid;gap:var(--space-3);transition:opacity var(--dur-quick) var(--ease-drift)}
+.tl__item.is-dim{opacity:.35}
+.tl__item::before{content:"";position:absolute;left:calc(-1 * var(--space-7) + 1px);top:7px;width:9px;height:9px;border-radius:var(--radius-pill);
+background:var(--bg-page);border:var(--hairline) solid var(--line-2);transition:background var(--dur-quick) var(--ease-drift),border-color var(--dur-quick) var(--ease-drift)}
+.tl__item:hover::before,.tl__item.is-related::before{background:var(--thread);border-color:var(--thread)}
+.tl__head{display:flex;gap:var(--space-4);align-items:baseline;flex-wrap:wrap}
+.tl__t{font-family:var(--font-display);font-weight:600;font-size:var(--text-base);letter-spacing:var(--tracking-tight)}
+.tl__body{font:400 var(--text-base)/var(--leading-normal) var(--font-serif);color:var(--text-muted);max-width:var(--measure)}
+
+/* —— evidence —— */
+details.ev{border-top:var(--hairline) solid var(--line-1);padding-top:var(--space-4)}
+details.ev>summary{cursor:pointer;list-style:none;font:500 var(--text-micro)/1.2 var(--font-mono);letter-spacing:var(--tracking-caps);
+text-transform:uppercase;color:var(--text-subtle)}
+details.ev>summary::-webkit-details-marker{display:none}
+details.ev>summary:hover{color:var(--fg-accent)}
+details.ev[open]>summary{margin-bottom:var(--space-5)}
+.ev__body{display:grid;gap:var(--space-5)}
+.md{font:400 var(--text-base)/var(--leading-read) var(--font-serif);max-width:var(--measure);display:grid;gap:var(--space-4)}
+.md h3{font-family:var(--font-display);font-weight:600;font-size:var(--text-base);letter-spacing:var(--tracking-tight)}
+.md code{font:400 0.92em/1.4 var(--font-mono);background:var(--bg-sunken);padding:1px 4px;border-radius:var(--radius-sm)}
+.md ul{display:grid;gap:var(--space-2)}
+.md li{padding-left:var(--space-5);position:relative}
+.md li::before{content:"·";position:absolute;left:var(--space-2);color:var(--accent)}
+.md a{border-bottom:var(--hairline) solid var(--line-2)}
+.md a:hover{color:var(--fg-accent);border-color:var(--thread)}
+pre{margin:0;overflow-x:auto;background:var(--bg-sunken);border:var(--hairline) solid var(--line-1);border-radius:var(--radius-md);
+padding:var(--space-4);font:400 var(--text-xs)/1.6 var(--font-mono)}
+.diff{display:grid;gap:var(--space-2)}
+.diff__p{font:400 var(--text-micro)/1.4 var(--font-mono);color:var(--text-subtle)}
+.diff pre b{display:block;font-weight:400}
+.diff pre .add{color:var(--success)}
+.diff pre .del{color:var(--danger)}
+.diff pre .hunk{color:var(--text-subtle)}
+.mermaid{background:var(--bg-sunken);border:var(--hairline) solid var(--line-1);border-radius:var(--radius-md);padding:var(--space-5);
+overflow-x:auto;text-align:center;font-family:var(--font-mono);font-size:var(--text-xs)}
+
+/* —— section headings, empties, archive —— */
+.sec{display:grid;gap:var(--space-5)}
+.sec__h{font-family:var(--font-display);font-weight:600;font-size:var(--text-lg);letter-spacing:var(--tracking-display)}
+.empty{display:grid;gap:var(--space-4);padding-block:var(--space-8);border-top:var(--hairline) solid var(--line-1);max-width:var(--measure)}
+.empty p{font:400 var(--text-md)/var(--leading-normal) var(--font-serif);font-style:italic;color:var(--text-muted)}
+.empty code{font:400 var(--text-xs)/1.8 var(--font-mono);color:var(--text-subtle)}
+details.arch{border-top:var(--hairline) solid var(--line-1);padding-top:var(--space-4)}
+details.arch>summary{cursor:pointer;list-style:none;font:400 var(--text-xs)/1.4 var(--font-mono);color:var(--text-subtle)}
+details.arch>summary::-webkit-details-marker{display:none}
+details.arch>summary:hover{color:var(--fg-accent)}
+.arch__list{display:grid;gap:var(--space-3);padding-top:var(--space-5)}
+.arch__row{display:grid;grid-template-columns:auto 1fr auto;gap:var(--space-4);align-items:baseline;
+font:400 var(--text-xs)/1.5 var(--font-mono);color:var(--text-subtle)}
+.arch__row b{font-family:var(--font-display);font-weight:500;font-size:var(--text-sm);color:var(--text-muted)}
+
+/* —— toast: bottom-left, ink —— */
+.toasts{position:fixed;left:var(--gutter);bottom:var(--space-6);z-index:40;display:grid;gap:var(--space-3);max-width:min(380px,90vw)}
+.toast{background:var(--ink-900);color:var(--paper-100);border-radius:var(--radius-md);box-shadow:var(--shadow-3);
+padding:var(--space-4) var(--space-5);display:grid;gap:var(--space-2);animation:ln-rise var(--dur-base) var(--ease-drift) both}
+.toast b{font-family:var(--font-display);font-weight:600;font-size:var(--text-sm)}
+.toast span{font:400 var(--text-xs)/1.5 var(--font-mono);color:var(--stone-400)}
+.toast--warning b{color:var(--ochre-400)}
+
+@media (max-width:640px){
+  .row{grid-template-columns:auto 1fr}
+  .row__side{grid-column:2;justify-items:start;text-align:left}
+  .claims{min-width:0}
+  .hdr__in{gap:var(--space-5)}
+  .stamp{margin-left:0;width:100%}
+}
+@media (prefers-reduced-motion:reduce){*{animation-duration:1ms !important;transition-duration:1ms !important}}
+</style>
+
+<header class="hdr">
+  <div class="wrap hdr__in">
+    <div class="wordmark" id="wordmark">Console<span class="stop">.</span></div>
+    <div class="tabs" role="tablist" id="tabs">
+      <button class="tab" role="tab" id="tab-inbox" aria-selected="true" data-view="inbox">Inbox<span class="tab__n" id="n-inbox"></span></button>
+      <button class="tab" role="tab" id="tab-maps" aria-selected="false" data-view="maps">Maps<span class="tab__n" id="n-maps"></span></button>
+      <button class="tab" role="tab" id="tab-reports" aria-selected="false" data-view="reports">Reports<span class="tab__n" id="n-reports"></span></button>
+      <button class="tab" role="tab" id="tab-history" aria-selected="false" data-view="history">History<span class="tab__n" id="n-history"></span></button>
+      <span class="tabs__ind" id="tab-ind"></span>
+    </div>
+    <div class="stamp" id="stamp">connecting</div>
+  </div>
+</header>
+
+<main class="wrap">
+  <section class="view" id="view-inbox" role="tabpanel" aria-labelledby="tab-inbox"></section>
+  <section class="view" id="view-maps" role="tabpanel" aria-labelledby="tab-maps" hidden></section>
+  <section class="view" id="view-reports" role="tabpanel" aria-labelledby="tab-reports" hidden></section>
+  <section class="view" id="view-history" role="tabpanel" aria-labelledby="tab-history" hidden></section>
+</main>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/mermaid/10.9.1/mermaid.min.js"></script>
+<script>
+"use strict";
+/* The console reads its whole world from the database: every project-specific
+   fact is a row. Nothing below tests a project by name. */
+const COLLECTIONS = ["proposals", "maps", "reports", "records"];
+const CLAIMS = ["verified", "partial", "unverified", "planned"];
+const CLAIM_TONE = {verified: "success", partial: "warning", unverified: "neutral", planned: "info"};
+const URGENCY_RANK = {blocking: 0, soon: 1, whenever: 2};
+const ARTY = {
+  proposals: "arty: file a proposal from a session that needs a judgement call",
+  maps: "arty sync --db DUMP --plan DIR",
+  reports: "arty: register a report when an analysis is published",
+  records: "arty sync --db DUMP --plan DIR"
+};
+
+const state = {project: null, view: "inbox", canEdit: false, db: null, ready: false};
+COLLECTIONS.forEach(c => state[c] = []);
+const el = id => document.getElementById(id);
+const esc = s => String(s == null ? "" : s).replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
+
+/* —— formatting —— */
+function fmtDate(v) {
+  if (!v) return "";
+  const d = new Date(v);
+  if (isNaN(d)) return String(v);
+  return d.toLocaleDateString("en-GB", {day: "numeric", month: "short", year: "numeric"});
+}
+function ago(v) {
+  if (!v) return "";
+  const days = Math.floor((Date.now() - new Date(v).getTime()) / 86400000);
+  if (isNaN(days)) return "";
+  if (days <= 0) return "today";
+  if (days === 1) return "yesterday";
+  return days + " days ago";
+}
+function badge(text, tone, opts) {
+  const o = opts || {};
+  const cls = ["badge"];
+  if (tone && tone !== "neutral") cls.push("badge--" + tone);
+  if (o.pulse) cls.push("badge--pulse");
+  return '<span class="' + cls.join(" ") + '">' + (o.dot || o.pulse ? '<i class="dot"></i>' : "") + esc(text) + "</span>";
+}
+function tags(anchors) {
+  if (!anchors || !anchors.length) return "";
+  return '<span class="tags">' + anchors.map(a => '<span class="tag">' + esc(a) + "</span>").join("") + "</span>";
+}
+
+/* —— a small markdown subset: agent-authored evidence, escaped first —— */
+function md(src) {
+  if (!src) return "";
+  const blocks = [];
+  String(src).split(/\n{2,}/).forEach(raw => {
+    const b = raw.trim();
+    if (!b) return;
+    if (/^###?\s/.test(b)) { blocks.push("<h3>" + inline(b.replace(/^#+\s*/, "")) + "</h3>"); return; }
+    if (/^([-*]\s)/m.test(b) && b.split("\n").every(l => /^[-*]\s/.test(l.trim()))) {
+      blocks.push("<ul>" + b.split("\n").map(l => "<li>" + inline(l.trim().replace(/^[-*]\s*/, "")) + "</li>").join("") + "</ul>");
+      return;
+    }
+    blocks.push("<p>" + inline(b) + "</p>");
+  });
+  return '<div class="md">' + blocks.join("") + "</div>";
+}
+function inline(s) {
+  return esc(s)
+    .replace(/`([^`]+)`/g, (m, c) => "<code>" + c + "</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+    .replace(/(^|[\s(])\*([^*]+)\*/g, "$1<em>$2</em>")
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1 <span class="ext">&#8599;</span></a>')
+    .replace(/\n/g, " ");
+}
+function diff(d) {
+  const lines = String(d.patch || "").split("\n").map(l => {
+    const cls = l.startsWith("+") ? "add" : l.startsWith("-") ? "del" : l.startsWith("@@") ? "hunk" : "";
+    return "<b" + (cls ? ' class="' + cls + '"' : "") + ">" + esc(l || " ") + "</b>";
+  }).join("");
+  return '<div class="diff">' + (d.path ? '<div class="diff__p">' + esc(d.path) + "</div>" : "") + "<pre>" + lines + "</pre></div>";
+}
+function evidence(ev) {
+  if (!ev) return "";
+  const parts = [];
+  if (ev.markdown) parts.push(md(ev.markdown));
+  if (ev.mermaid) parts.push('<pre class="mermaid">' + esc(ev.mermaid) + "</pre>");
+  (ev.diffs || []).forEach(d => parts.push(diff(d)));
+  (ev.exhibits || []).forEach(u => parts.push('<div class="meta"><a href="' + esc(u) + '" target="_blank" rel="noopener">' + esc(u) + ' <span class="ext">&#8599;</span></a></div>'));
+  if (!parts.length) return "";
+  return '<details class="ev"><summary>Evidence</summary><div class="ev__body">' + parts.join("") + "</div></details>";
+}
+
+/* —— mermaid, themed to Sobar. Hex only: the library cannot parse oklch(). —— */
+function diagramTheme() {
+  const ink = isDark();
+  return {
+    startOnLoad: false, securityLevel: "strict", fontFamily: '"Fira Code",monospace', fontSize: 12,
+    theme: "base",
+    themeVariables: ink
+      ? {background: "#1F1A16", primaryColor: "#2C2520", primaryTextColor: "#F8F3EA", primaryBorderColor: "#8C8378",
+         lineColor: "#E0603C", secondaryColor: "#332A22", tertiaryColor: "#241E19", textColor: "#F8F3EA"}
+      : {background: "#F2EDE3", primaryColor: "#FDFBF7", primaryTextColor: "#231C17", primaryBorderColor: "#8C8378",
+         lineColor: "#B63E20", secondaryColor: "#F8F3EA", tertiaryColor: "#F2EDE3", textColor: "#231C17"}
+  };
+}
+function isDark() {
+  const stamped = document.documentElement.getAttribute("data-theme");
+  if (stamped === "dark") return true;
+  if (stamped === "light") return false;
+  return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+}
+let diagramSeq = 0;
+function drawDiagrams(scope) {
+  if (typeof mermaid === "undefined") return;
+  const nodes = [...scope.querySelectorAll("pre.mermaid")].filter(n => !n.dataset.drawn);
+  if (!nodes.length) return;
+  nodes.forEach(n => { n.dataset.drawn = "1"; n.dataset.src = n.dataset.src || n.textContent; n.id = "mmd-" + (++diagramSeq); });
+  try {
+    mermaid.initialize(diagramTheme());
+    mermaid.run({nodes: nodes, suppressErrors: true});
+  } catch (e) { /* the source stays readable as code */ }
+}
+function redrawDiagrams() {
+  document.querySelectorAll("pre.mermaid[data-src]").forEach(n => {
+    n.removeAttribute("data-processed"); n.removeAttribute("data-drawn"); n.textContent = n.dataset.src;
+  });
+  drawDiagrams(document);
+}
+
+/* —— relations: hovering one thing shows what it touches —— */
+function wireRelations(scope) {
+  const items = [...scope.querySelectorAll("[data-anchors]")];
+  if (items.length < 2) return;
+  const anchorsOf = node => { try { return JSON.parse(node.dataset.anchors || "[]"); } catch (e) { return []; } };
+  items.forEach(node => {
+    const mine = anchorsOf(node);
+    if (!mine.length) return;
+    node.addEventListener("mouseenter", () => {
+      const set = new Set(mine);
+      items.forEach(other => {
+        if (other === node) return;
+        const hit = anchorsOf(other).some(a => set.has(a));
+        other.classList.toggle("is-related", hit);
+        other.classList.toggle("is-dim", !hit);
+      });
+      scope.querySelectorAll(".tag").forEach(t => t.classList.toggle("tag--related", set.has(t.textContent)));
+    });
+    node.addEventListener("mouseleave", () => {
+      items.forEach(o => o.classList.remove("is-related", "is-dim"));
+      scope.querySelectorAll(".tag--related").forEach(t => t.classList.remove("tag--related"));
+    });
+  });
+}
+
+/* —— views —— */
+function emptyState(kind, line) {
+  return '<div class="empty"><p>' + esc(line) + "</p><code>" + esc(ARTY[kind]) + "</code></div>";
+}
+
+function keep(view) {
+  const draft = {notes: {}, picked: {}, open: []};
+  view.querySelectorAll("textarea").forEach(t => { if (t.value) draft.notes[t.id] = t.value; });
+  view.querySelectorAll("input[type=radio]:checked").forEach(r => draft.picked[r.name] = r.value);
+  view.querySelectorAll("details[open]").forEach(d => draft.open.push(d.querySelector("summary").textContent));
+  return draft;
+}
+function restore(view, draft) {
+  Object.keys(draft.notes).forEach(id => { const t = el(id); if (t) t.value = draft.notes[id]; });
+  Object.keys(draft.picked).forEach(name => {
+    const r = view.querySelector('input[name="' + name + '"][value="' + draft.picked[name] + '"]');
+    if (r) r.checked = true;
+  });
+  view.querySelectorAll("details").forEach(d => {
+    if (draft.open.includes(d.querySelector("summary").textContent)) d.open = true;
+  });
+}
+
+function renderInbox() {
+  const view = el("view-inbox");
+  const draft = keep(view);
+  const open = state.proposals.filter(p => p.status === "open")
+    .sort((a, b) => (URGENCY_RANK[a.urgency] ?? 9) - (URGENCY_RANK[b.urgency] ?? 9) || String(b.asked_at || "").localeCompare(String(a.asked_at || "")));
+  const answered = state.proposals.filter(p => p.status === "answered");
+  const closed = state.proposals.filter(p => ["accepted", "withdrawn", "superseded"].includes(p.status));
+  const live = answered.concat(open);
+  const html = [];
+
+  if (!live.length) {
+    html.push(emptyState("proposals", state.ready ? "Nothing is waiting on you." : "Reading the console…"));
+  } else {
+    live.forEach((p, i) => html.push(proposalCard(p, i)));
+  }
+  if (closed.length) {
+    html.push('<details class="arch"><summary>' + closed.length + " decided · archived</summary><div class=\"arch__list\">" +
+      closed.sort((a, b) => String(b.asked_at || "").localeCompare(String(a.asked_at || ""))).map(p =>
+        '<div class="arch__row"><span>' + esc(p.status) + "</span><b>" + esc(p.title || p.id) + "</b><span>" +
+        esc((p.outcome && p.outcome.adr) || (p.answer && p.answer.choice) || "") + "</span></div>").join("") +
+      "</div></details>");
+  }
+  view.innerHTML = html.join("");
+  restore(view, draft);
+  view.querySelectorAll("form[data-proposal]").forEach(wireAnswerForm);
+  wireRelations(view);
+  drawDiagrams(view);
+}
+
+function proposalCard(p, i) {
+  const answered = p.status === "answered";
+  const options = Array.isArray(p.options) ? p.options : [];
+  const chosen = answered && p.answer ? options.find(o => o.key === p.answer.choice) : null;
+  const head = [
+    '<span class="eyebrow">Decision · № ' + String(i + 1).padStart(2, "0") + "</span>",
+    answered
+      ? badge("awaiting pickup", "info", {dot: true})
+      : badge(p.urgency || "whenever", p.urgency === "blocking" ? "accent" : "neutral", {pulse: p.urgency === "blocking", dot: true})
+  ].join("");
+
+  const body = [
+    '<div class="card__head">' + head + "</div>",
+    '<h2 class="card__title">' + esc(p.title || p.id) + "</h2>",
+    p.question ? '<p class="card__q">' + esc(p.question) + "</p>" : "",
+    p.assumption ? '<div class="assume"><span class="assume__k">Meanwhile</span><span class="assume__v">' + esc(p.assumption) + "</span></div>" : "",
+    evidence(p.evidence)
+  ];
+
+  if (answered) {
+    body.push('<div class="opts"><div class="opt"><span class="row__i">→</span><div><div class="opt__label">' +
+      esc(chosen ? chosen.label : p.answer.choice) + '<span class="rec">your choice</span></div>' +
+      (p.answer.notes ? '<div class="opt__sum">' + esc(p.answer.notes) + "</div>" : "") +
+      '<div class="opt__trade">answered ' + esc(ago(p.answer.answered_at)) + " · no session has picked it up yet</div></div></div></div>");
+  } else if (state.canEdit) {
+    body.push('<form data-proposal="' + esc(p.id) + '"><div class="opts">' + options.map((o, n) =>
+      '<label class="opt"><input type="radio" name="opt-' + esc(p.id) + '" value="' + esc(o.key) + '" id="opt-' + esc(p.id) + "-" + esc(o.key) + '"' +
+      (o.recommended ? " checked" : (n === 0 && !options.some(x => x.recommended) ? " checked" : "")) + '><div>' +
+      '<div class="opt__label">' + esc(o.label || o.key) + (o.recommended ? '<span class="rec">recommended</span>' : "") + "</div>" +
+      (o.summary ? '<div class="opt__sum">' + esc(o.summary) + "</div>" : "") +
+      (o.tradeoffs ? '<div class="opt__trade">' + esc(o.tradeoffs) + "</div>" : "") +
+      "</div></label>").join("") + "</div>" +
+      '<div class="field" style="margin-top:var(--space-5)"><textarea id="notes-' + esc(p.id) + '" placeholder="Anything the session should know…"></textarea></div>' +
+      '<div class="actions" style="margin-top:var(--space-5)"><button class="btn" type="submit"><span>Record decision</span></button>' +
+      '<button class="btn btn--ghost" type="button" data-withdraw="' + esc(p.id) + '">No longer matters</button></div></form>');
+  } else {
+    body.push('<div class="opts">' + options.map(o => '<div class="opt"><span class="row__i">·</span><div><div class="opt__label">' +
+      esc(o.label || o.key) + (o.recommended ? '<span class="rec">recommended</span>' : "") + "</div>" +
+      (o.summary ? '<div class="opt__sum">' + esc(o.summary) + "</div>" : "") + "</div></div>").join("") + "</div>");
+  }
+
+  body.push('<div class="meta">asked ' + esc(ago(p.asked_at)) + (p.asked_by ? " · " + esc(p.asked_by) : "") + "</div>");
+  if (p.anchors && p.anchors.length) body.push(tags(p.anchors));
+
+  return '<article class="card' + (p.urgency === "blocking" && !answered ? " card--live" : "") +
+    '" data-anchors="' + esc(JSON.stringify(p.anchors || [])) + '" style="animation-delay:' + (i * 60) + 'ms">' +
+    body.filter(Boolean).join("") + "</article>";
+}
+
+function wireAnswerForm(form) {
+  const id = form.dataset.proposal;
+  form.addEventListener("submit", e => {
+    e.preventDefault();
+    const picked = form.querySelector("input[type=radio]:checked");
+    if (!picked) return;
+    const notes = (el("notes-" + id) || {}).value || "";
+    const btn = form.querySelector("button[type=submit]");
+    btn.disabled = true;
+    write(id, {
+      status: "answered",
+      answer: {choice: picked.value, notes: notes.trim(), answered_at: new Date().toISOString()}
+    }, "Decision recorded", btn);
+  });
+  const w = form.querySelector("[data-withdraw]");
+  if (w) w.addEventListener("click", () => {
+    w.disabled = true;
+    write(id, {status: "withdrawn", answer: {choice: "", notes: "No longer matters.", answered_at: new Date().toISOString()}}, "Withdrawn", w);
+  });
+}
+
+function write(id, patch, ok, btn) {
+  if (!state.db) return;
+  state.db.doc("proposals/" + id).update(patch)
+    .then(() => toast(ok, "The next session picks it up."))
+    .catch(err => {
+      if (btn) btn.disabled = false;
+      toast("Not recorded", (err && (err.message || err.code)) || "The write was refused.", "warning");
+    });
+}
+
+function renderMaps() {
+  const view = el("view-maps");
+  const live = state.maps.filter(m => m.status !== "retired")
+    .sort((a, b) => (a.status === "stale" ? 0 : 1) - (b.status === "stale" ? 0 : 1) || String(a.title || "").localeCompare(String(b.title || "")));
+  const retired = state.maps.filter(m => m.status === "retired");
+  const html = [];
+  if (!live.length) {
+    html.push(emptyState("maps", state.ready ? "No maps are registered." : "Reading the console…"));
+  } else {
+    html.push('<div class="index">' + live.map((m, i) => mapRow(m, i)).join("") + "</div>");
+  }
+  if (retired.length) html.push(archive(retired, "retired"));
+  view.innerHTML = html.join("");
+  wireRelations(view);
+}
+
+function mapRow(m, i) {
+  const stale = m.status === "stale";
+  const counts = m.claims || {};
+  const total = CLAIMS.reduce((n, k) => n + (Number(counts[k]) || 0), 0);
+  const bar = total
+    ? '<div class="bar">' + CLAIMS.map(k => {
+        const n = Number(counts[k]) || 0;
+        return n ? '<span class="s-' + k + '" style="width:' + (n / total * 100) + '%"></span>' : "";
+      }).join("") + "</div>" +
+      '<div class="legend">' + CLAIMS.filter(k => Number(counts[k])).map(k =>
+        '<span><i style="background:' + (k === "unverified" ? "var(--stone-400)" : "var(--" + CLAIM_TONE[k] + ")") + '"></i>' +
+        counts[k] + " " + k + "</span>").join("") + "</div>"
+    : '<div class="legend"><span>no claims recorded</span></div>';
+
+  const why = stale && (m.invalidated_by || []).length
+    ? '<div class="row__why">' + m.invalidated_by.slice(0, 5).map(c =>
+        '<span class="commit"><b>' + esc(c.commit || "") + "</b> " + esc(c.subject || "") + "</span>").join("") +
+      (m.invalidated_count > (m.invalidated_by || []).length
+        ? '<span class="commit">and ' + (m.invalidated_count - m.invalidated_by.length) + " more</span>" : "") + "</div>"
+    : "";
+
+  return '<a class="row" href="' + esc(m.url || "#") + '" target="_blank" rel="noopener" data-anchors="' + esc(JSON.stringify(m.anchors || [])) + '">' +
+    '<span class="row__i">' + String(i + 1).padStart(2, "0") + "</span>" +
+    '<div class="row__main"><span class="row__t">' + esc(m.title || m.id) + ' <span class="ext">&#8599;</span></span>' +
+    (m.purpose ? '<span class="row__sub">' + esc(m.purpose) + "</span>" : "") +
+    (m.anchors && m.anchors.length ? tags(m.anchors) : "") + why + "</div>" +
+    '<div class="row__side">' + (stale ? badge("stale", "danger", {dot: true}) : badge("current", "success", {dot: true})) +
+    '<div class="claims">' + bar + "</div>" +
+    '<span class="meta">' + (m.refreshed_at ? "refreshed " + esc(ago(m.refreshed_at)) : "") + "</span></div></a>";
+}
+
+function renderReports() {
+  const view = el("view-reports");
+  const live = state.reports.filter(r => r.status === "current")
+    .sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")));
+  const done = state.reports.filter(r => r.status !== "current");
+  const html = [];
+  if (!live.length) {
+    html.push(emptyState("reports", state.ready ? "No open questions have a report." : "Reading the console…"));
+  } else {
+    html.push('<div class="index">' + live.map((r, i) =>
+      (r.url ? '<a class="row" href="' + esc(r.url) + '" target="_blank" rel="noopener"' : '<div class="row"') +
+      ' data-anchors="' + esc(JSON.stringify(r.anchors || [])) + '">' +
+      '<span class="row__i">' + String(i + 1).padStart(2, "0") + "</span>" +
+      '<div class="row__main"><span class="row__t">' + esc(r.title || r.id) + (r.url ? ' <span class="ext">&#8599;</span>' : "") + "</span>" +
+      (r.question ? '<span class="row__sub">' + esc(r.question) + "</span>" : "") +
+      (r.answer ? md(r.answer) : "") + (r.markdown && !r.url ? md(r.markdown) : "") +
+      (r.anchors && r.anchors.length ? tags(r.anchors) : "") + "</div>" +
+      '<div class="row__side"><span class="meta">' + esc(fmtDate(r.date)) + "</span>" +
+      (r.path ? '<span class="meta">' + esc(r.path) + "</span>" : "") + "</div>" +
+      (r.url ? "</a>" : "</div>")).join("") + "</div>");
+  }
+  if (done.length) html.push(archive(done, "settled"));
+  view.innerHTML = html.join("");
+  wireRelations(view);
+  drawDiagrams(view);
+}
+
+function renderHistory() {
+  const view = el("view-history");
+  const live = state.records.filter(r => r.status !== "missing")
+    .sort((a, b) => String(b.date || "").localeCompare(String(a.date || "")) || String(b.time || "").localeCompare(String(a.time || "")));
+  if (!live.length) {
+    view.innerHTML = emptyState("records", state.ready ? "No decisions or changes are recorded yet." : "Reading the console…");
+    return;
+  }
+  const byProposal = {};
+  state.proposals.forEach(p => { if (p.outcome && p.outcome.adr) byProposal[p.outcome.adr] = p; });
+  view.innerHTML = '<div class="tl">' + live.map(r => {
+    const p = byProposal[r.path];
+    const tone = r.status === "superseded" ? "warning" : r.status === "stale" ? "neutral" : r.kind === "adr" ? "accent" : "neutral";
+    return '<article class="tl__item" data-anchors="' + esc(JSON.stringify((p && p.anchors) || [])) + '">' +
+      '<div class="tl__head"><span class="meta">' + esc(fmtDate(r.date)) + "</span>" +
+      '<span class="tl__t">' + esc(r.title || r.id) + "</span>" +
+      badge(r.kind === "adr" ? "decision" : "change", tone) +
+      (r.status === "superseded" ? badge("superseded", "warning") : "") +
+      (r.status === "stale" ? badge("stale", "neutral") : "") + "</div>" +
+      (r.summary ? '<p class="tl__body">' + esc(r.summary) + "</p>" : "") +
+      '<div class="meta">' + esc(r.path || "") + (p ? " · from “" + esc(p.title) + "”" : "") + "</div>" +
+      ((r.exhibits || []).length ? '<div class="meta">' + r.exhibits.map(u =>
+        '<a href="' + esc(u) + '" target="_blank" rel="noopener">exhibit <span class="ext">&#8599;</span></a>').join(" · ") + "</div>" : "") +
+      "</article>";
+  }).join("") + "</div>";
+  wireRelations(view);
+}
+
+function archive(rows, word) {
+  return '<details class="arch"><summary>' + rows.length + " " + word + " · archived</summary><div class=\"arch__list\">" +
+    rows.map(r => '<div class="arch__row"><span>' + esc(r.status || "") + "</span><b>" + esc(r.title || r.id) + "</b>" +
+      (r.url ? '<a class="meta" href="' + esc(r.url) + '" target="_blank" rel="noopener">open <span class="ext">&#8599;</span></a>' : "<span></span>") +
+      "</div>").join("") + "</div></details>";
+}
+
+/* —— chrome —— */
+function renderChrome() {
+  const name = (state.project && state.project.project) || document.title.replace(/\s*Console\s*$/, "") || "Console";
+  el("wordmark").innerHTML = esc(name) + '<span class="stop">.</span>';
+  const open = state.proposals.filter(p => p.status === "open").length;
+  const answered = state.proposals.filter(p => p.status === "answered").length;
+  const stale = state.maps.filter(m => m.status === "stale").length;
+  el("n-inbox").textContent = open + answered ? String(open + answered) : "";
+  el("n-maps").textContent = state.maps.filter(m => m.status !== "retired").length || "";
+  el("n-reports").textContent = state.reports.filter(r => r.status === "current").length || "";
+  el("n-history").textContent = state.records.length || "";
+  const bits = [];
+  const checked = state.maps.map(m => m.checked_at).filter(Boolean).sort().pop();
+  if (checked) bits.push("synced " + ago(checked));
+  if (stale) bits.push(stale + (stale === 1 ? " stale map" : " stale maps"));
+  if (!state.canEdit && state.ready) bits.push("read only");
+  el("stamp").textContent = bits.join(" · ") || (state.ready ? "nothing synced yet" : "connecting");
+}
+
+function renderAll() { renderChrome(); renderInbox(); renderMaps(); renderReports(); renderHistory(); }
+
+function setView(name) {
+  state.view = name;
+  ["inbox", "maps", "reports", "history"].forEach(v => {
+    el("view-" + v).hidden = v !== name;
+    el("tab-" + v).setAttribute("aria-selected", String(v === name));
+  });
+  const tab = el("tab-" + name), ind = el("tab-ind");
+  ind.style.width = tab.offsetWidth + "px";
+  ind.style.transform = "translateX(" + tab.offsetLeft + "px)";
+  drawDiagrams(el("view-" + name));
+}
+
+function toast(title, line, tone) {
+  const node = document.createElement("div");
+  node.className = "toast" + (tone ? " toast--" + tone : "");
+  node.innerHTML = "<b>" + esc(title) + "</b>" + (line ? "<span>" + esc(line) + "</span>" : "");
+  el("toasts").appendChild(node);
+  setTimeout(() => node.remove(), 5200);
+}
+
+/* —— boot —— */
+el("tabs").addEventListener("click", e => {
+  const tab = e.target.closest(".tab");
+  if (tab) setView(tab.dataset.view);
+});
+window.addEventListener("resize", () => setView(state.view));
+if (window.matchMedia) {
+  const mq = window.matchMedia("(prefers-color-scheme: dark)");
+  mq.addEventListener && mq.addEventListener("change", redrawDiagrams);
+}
+new MutationObserver(redrawDiagrams).observe(document.documentElement, {attributes: true, attributeFilter: ["data-theme"]});
+renderAll();
+setView("inbox");
+
+(async () => {
+  const db = window.claude && await window.claude.use("db");
+  const user = window.claude && await window.claude.use("user");
+  state.canEdit = !!(user && user.canEdit && user.canEdit());
+  if (!db) {
+    state.ready = true;
+    el("stamp").textContent = "signed out";
+    el("view-inbox").innerHTML = '<div class="empty"><p>The console reads its rows as the signed-in viewer, and nobody is signed in here.</p></div>';
+    renderChrome();
+    return;
+  }
+  state.db = db;
+  state.ready = true;
+  db.doc("meta/project").onSnapshot(snap => { state.project = snap.data() || null; renderChrome(); }, () => {});
+  COLLECTIONS.forEach(name => {
+    db.collection(name).onSnapshot(snap => {
+      state[name] = snap.docs.map(d => Object.assign({id: d.id}, d.data() || {}));
+      renderAll();
+      if (name === "proposals" && state.proposals.some(p => p.status === "open" || p.status === "answered")) setView(state.view);
+    }, err => toast("Could not read " + name, (err && err.message) || "", "warning"));
+  });
+})();
+</script>
+"""
+
+if __name__ == "__main__":
+    main()

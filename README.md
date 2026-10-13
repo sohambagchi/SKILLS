@@ -7,6 +7,7 @@ Personal agent skills. One skill per directory, each loadable alone, all composa
 | Skill | Description |
 |---|---|
 | [amail](amail/SKILL.md) | Messages other independent agent instances with AgentMail, a folder of markdown mail files. Uses `/proj` on CloudLab, and `~/amail` elsewhere when the user asks. Includes `amail-tui`, a read-only browser for humans. |
+| [arty](arty/SKILL.md) | Maintains a project console: one claude.ai artifact per project holding the decision inbox, the live maps of the code with per-claim confidence, dated reports, and a timeline projected from the project's ADRs and changelogs. Includes `arty`, which owns git, the schema and the page. |
 | [asm-analysis](asm-analysis/SKILL.md) | Standardizes a cross-variant workspace that puts N programs side by side in two aligned rows — authored source on top, generated code below — with a portable bundle format, a git-tracked annotation store, and workflows for extracting the mapping, chunking the corpus for annotation, and keeping both current. Includes `asmviz`, a validator and reference viewer. |
 | [code-comments](code-comments/SKILL.md) | Decides what code needs a comment, what doesn't, how long the comment should be, and when an explanation is too big for a comment and belongs in a document instead. |
 | [docky](docky/SKILL.md) | Maintains a project's `docs/` tree: timestamped ADRs, changelogs and analysis reports, plus TODO, index and a stale archive, kept brief and non-overlapping. |
