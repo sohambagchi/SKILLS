@@ -19,7 +19,7 @@ Personal agent skills. One skill per directory, each loadable alone, all composa
 ## Rules
 
 - **Layout:** `<skill-name>/SKILL.md` plus optional helper scripts (and their `requirements.txt`). Nothing else in a skill directory.
-- **No extra docs:** The only markdown outside skill directories is this README. No `CLAUDE.md`, `AGENTS.md`, `CONTRIBUTING.md`, `docs/`, changelogs, notes, or per-skill READMEs.
+- **No extra docs:** Outside skill directories, the only markdown is this README and the `docs/` tree **docky** owns — every project keeps one so decisions have a durable home in git ([ADR](docs/adr/2026-10-20-1114-every-project-keeps-a-docs-tree.md)). No `CLAUDE.md`, `AGENTS.md`, `CONTRIBUTING.md`, loose notes, or per-skill READMEs.
 - **Concise:** A `SKILL.md` has frontmatter (`name`, `description`) and the minimum instructions needed. No background, rationale, or examples unless the skill fails without them.
 - **Description shape:** The `description` says in the third person what the skill does, then `Use when <situations>.`, then `Triggers: <phrases a user would say>.` The index entry above reuses the first part.
 - **No overlap:** Each skill owns one concern. If two skills would say the same thing, put it in one and reference that skill by name.

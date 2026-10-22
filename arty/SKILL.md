@@ -44,7 +44,9 @@ behind, a TODO list docky's rules say is untidy. No deviations, nothing to decid
 
 Read `.arty` first. No pointer means no console — offer section 2, don't invent one.
 The pointer is the only thing arty adds to the repository: live state is never
-mirrored into git, and the console is never the home of an ADR.
+mirrored into git, and the console is never the home of an ADR. A repository with a
+console therefore keeps **docky**'s `docs/` tree, whatever its own rules say about
+markdown: an accepted proposal with no ADR is a decision with no durable home.
 
 What the page shows, and where each part comes from:
 

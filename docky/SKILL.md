@@ -26,6 +26,11 @@ docs/
 
 Create any missing piece on first use. Don't add other files or directories under `docs/`.
 
+Every project keeps this tree. A repository whose own rules forbid markdown outside
+some directory relaxes them for `docs/` rather than going without: a decision with
+no `docs/adr/` entry has no durable home, and a hosted console is a projection, not
+a record.
+
 Timestamped filenames: `YYYY-MM-DD-HHMM-<kebab-slug>.md`, time from `date +%Y-%m-%d-%H%M`. Never rename a timestamped file.
 
 ## Rules
