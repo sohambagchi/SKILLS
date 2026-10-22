@@ -341,6 +341,12 @@ URL forever**. Staleness is a bug.
 **Report:** a dated question and its answer. Immutable. Never refreshed; archived
 when the question is settled.
 
+**The deadline.** A map stale for more than 30 days (`STALE_WARN_DAYS`) is named in an
+`arty check` warning as well as the `stale` line. The clock runs from the oldest commit
+that touched the anchors since the map was refreshed (`stale_since`), not from when a
+sync first noticed. Nothing is rewritten or retired automatically: the call stays with
+whoever reads it -- refresh and re-anchor the map, or retire it to a dated report.
+
 **Inline map:** pictures that need no interactive page of their own -- a gallery
 of rendered assets, a set of screenshots -- live in the console itself. Publish the
 images as console files under `figures/<map-slug>/` (republish the `arty page`
