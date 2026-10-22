@@ -38,7 +38,7 @@ behind, a TODO list docky's rules say is untidy. No deviations, nothing to decid
 
 ```
 .arty                 tracked pointer: console = <url>, project, schema, docs paths
-<console artifact>    one per project: Now, Docs, History, Decisions, Maps & reports
+<console artifact>    one per project: Now, Board, Docs, History, Decisions, Maps & reports
 <exhibit artifacts>   the heavy visuals, registered as rows in the console
 ```
 
@@ -50,7 +50,8 @@ What the page shows, and where each part comes from:
 
 | Tab | Shows | Source |
 |---|---|---|
-| Now | HEAD's version, briefing (newest changelog, its ADRs, what left the TODO list, blockers), recently landed features, recent ADRs, waiting proposals, top TODOs, unmerged branches, attention items and deviations | snapshot + `proposals` + `maps` |
+| Now | HEAD's version, briefing (newest changelog, its ADRs, what left the TODO list, blockers), recently landed features, recent ADRs, waiting proposals and Review cards, top TODOs (Doing, then Next), unmerged branches, attention items and deviations | snapshot + `proposals` + `maps` |
+| Board | only when `TODO.md` is a docky board: Backlog, Next, Doing, Review, and Closed. Cards show category, stages (the current one marked), subtask progress, area tags, epic, blockers (linked when they name a card), and days in column or stage. Epic progress strip; filter by tag or epic; "as of" any commit | snapshot |
 | Docs | every file under `docs/` (and any directory `.arty` names) plus `README.md`, rendered, with cross-links and per-file history; "as of" any commit on HEAD's line | snapshot |
 | History | features grouped by `[X.Y]` (version-commit) with merged/open status, lane graph of the last 300 commits on every branch, commit inspector | snapshot |
 | Decisions | proposals: answer from any device | `proposals` |
@@ -64,7 +65,10 @@ line each:
 adr_dir = docs/ADR
 changelog_dir = docs/changelog
 stale_dir = docs/archive
+long_stages = rebuild, measure
 ```
+
+`long_stages` names the board stages drawn as long (section 4).
 
 A named directory that does not exist stops sync; it never reads as zero ADRs. One
 outside `docs/` is shown on the Docs tab too. Only files named
@@ -107,7 +111,7 @@ meta/project                   project, schema (3), remote, created, head
 snapshot/h-<id>                id, parts, bytes, generated_at, head, branch
 snapshot/p-<id>-NNN            id, n, data      a slice of the snapshot's JSON
                                written once by `arty sync`, never updated, never by hand
-                               the JSON carries `briefs` (section 4) and `deviations`
+                               the JSON carries `briefs` (section 4), `board` and `deviations`
 
 proposals/p-YYYYMMDD-HHMM-slug
   title          one line, the call to be made
@@ -170,7 +174,7 @@ a changelog and keeps `docs/TODO.md` current, so `arty sync` extracts it:
 | Decided | ADRs committed with that changelog, or carrying its timestamp |
 | Closed | TODO items present at the previous changelog and gone now — docky removes finished tasks |
 | Blocked | TODO items marked `— blocked: <on what>` (docky's convention), plus open blocking proposals |
-| Next then | when stepping back: the top of `TODO.md` as committed with that changelog |
+| Next then | when stepping back: the top of `TODO.md` as committed with that changelog (on a board, Doing then Next) |
 
 The page steps back through the last 30 changelogs, each with the TODO list as it
 stood then. A repository with no changelogs gets one briefing per version-commit
@@ -181,6 +185,32 @@ So **a good briefing is a good changelog**: outcomes, not activity ("the North
 Corridor slice is playable end to end", not "worked on the slice"), written when a
 change set lands. If 15 commits pass on HEAD's line with no new changelog, sync
 lists it as a deviation and the page says so on the briefing.
+
+### The board
+
+When `docs/TODO.md` is a board (docky's `## Doing` / `Review` / `Next` / `Backlog`
+headings, nothing else), sync adds `board` to the snapshot, with each card parsed
+from docky's card line (category, stages, area tags, epic, subtasks, details, blocker).
+The board is read-only, like everything in the snapshot. A card moves when docky moves
+its line.
+
+- **Days** come from the committed versions of `TODO.md`. They count days in the
+  column, or days in the current stage for a card with stages. A card counts as the same
+  card through a move, a small edit, or text added to the end. Uncommitted cards say
+  so.
+- **Long stages** are drawn dashed with ⧗. The defaults are `rebuild` and `measure`; a
+  project names its own in `.arty`: `long_stages = rebuild, measure, synth`.
+- **Epics** each get a bar across the flow: how many of their cards sit in each column,
+  and how many closed lately. Clicking one filters the board to it.
+- **Closed** is the cards that left the board in the last 14 days. Each links to the
+  changelog committed with its removal, or else to the commit that removed it.
+- **As of** a commit, the page reads that version of `TODO.md`. It shows no ages and no
+  Closed column.
+- **Review** cards also appear under *Waiting on you* on Now. Like proposals, they are
+  waiting on the user.
+
+The board's constants (`BOARD_WIP`, `BOARD_STUCK_DAYS`, `BOARD_CLOSED_DAYS`,
+`CATEGORIES`, `LONG_STAGES`) are at the top of `arty`'s board section.
 
 ## 5. Proposals
 
@@ -258,6 +288,7 @@ once the batches are written. Otherwise each line names what is off and the fix:
 | `docs` 15+ commits since the last changelog | write the changelog with docky — it is the briefing |
 | `docs` ticked items in `TODO.md` | remove them (docky); the changelog records completion |
 | `docs` a TODO or INDEX link to a missing file | repoint it or drop the line (docky) |
+| `docs` more than 3 cards in Doing, or one 14+ days in Doing (or in its current stage) | move it back to Next, split it, or mark the blocker (docky) |
 
 `arty check` errors are deviations too. The page shows the `docs` ones under
 Attention, so they are visible remotely until fixed.
@@ -382,7 +413,7 @@ arty init      --url URL [--name NAME] [--seed PATH]   # .arty pointer + meta/pr
 arty page      [--project NAME]                        # console HTML on stdout
 arty sync      --db DUMP --plan DIR [--force]          # snapshot + staleness -> batch plan
 arty check     --db DUMP                               # schema, ceilings, dangling anchors
-arty brief     [-n N]                                  # the briefing(s) the console shows, in a terminal
+arty brief     [-n N]                                  # the briefing(s) and board the console shows, in a terminal
 arty snapshot  --out FILE                              # the snapshot as one JSON file
 arty due       [--hook]                                # is the console behind? (Stop hook)
 ```
