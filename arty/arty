@@ -109,6 +109,14 @@ def now():
     return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
 
 
+def age_days(stamp):
+    """Days since a YYYY-MM-DD date or an ISO timestamp; 0 when it cannot be read."""
+    try:
+        return (time.time() - time.mktime(time.strptime(str(stamp)[:10], "%Y-%m-%d"))) / 86400
+    except (TypeError, ValueError):
+        return 0
+
+
 def read_pointer(root):
     """Parse .arty -- `key = value` lines, blank lines and # comments ignored."""
     path = os.path.join(root, POINTER)
@@ -1355,11 +1363,7 @@ def cmd_check(args):
         if status == "accepted" and not (row.get("outcome") or {}).get("adr"):
             warn(where, "accepted without an ADR -- the decision has no durable home")
         if status == "open" and row.get("urgency") == "blocking":
-            asked = str(row.get("asked_at", ""))[:10]
-            try:
-                age = (time.time() - time.mktime(time.strptime(asked, "%Y-%m-%d"))) / 86400
-            except ValueError:
-                age = 0
+            age = age_days(row.get("asked_at"))
             if age > BLOCKING_AGE_DAYS:
                 warn(where, "blocking and %d days old" % age)
 
