@@ -1007,10 +1007,19 @@ function write(id, patch, ok, btn) {
     });
 }
 
+/* A map's staleness is computed by `arty sync` into the snapshot; a row still
+   saying "stale" was written by a schema-3 sync, before that. */
+function mapState(m) {
+  const st = state.snap && state.snap.maps && state.snap.maps[m.id];
+  if (m.status === "retired") return {stale: false, by: [], count: 0};
+  if (st) return st;
+  return {stale: m.status === "stale", by: m.invalidated_by || [], count: m.invalidated_count || 0};
+}
+const isStale = m => m.status !== "retired" && mapState(m).stale;
 function renderMaps() {
   const view = el("view-maps");
   const live = state.maps.filter(m => m.status !== "retired")
-    .sort((a, b) => (a.status === "stale" ? 0 : 1) - (b.status === "stale" ? 0 : 1) || String(a.title || "").localeCompare(String(b.title || "")));
+    .sort((a, b) => (isStale(a) ? 0 : 1) - (isStale(b) ? 0 : 1) || String(a.title || "").localeCompare(String(b.title || "")));
   const retired = state.maps.filter(m => m.status === "retired");
   const draft = keep(view);
   const html = [];
@@ -1027,7 +1036,7 @@ function renderMaps() {
 }
 
 function mapRow(m, i) {
-  const stale = m.status === "stale";
+  const st = mapState(m), stale = st.stale;
   const counts = m.claims || {};
   const total = CLAIMS.reduce((n, k) => n + (Number(counts[k]) || 0), 0);
   const bar = total
@@ -1040,11 +1049,10 @@ function mapRow(m, i) {
         counts[k] + " " + k + "</span>").join("") + "</div>"
     : isInline(m) ? "" : '<div class="legend"><span>no claims recorded</span></div>';
 
-  const why = stale && (m.invalidated_by || []).length
-    ? '<div class="row__why">' + m.invalidated_by.slice(0, 5).map(c =>
+  const why = stale && st.by.length
+    ? '<div class="row__why">' + st.by.slice(0, 5).map(c =>
         '<span class="commit"><b>' + esc(c.commit || "") + "</b> " + esc(c.subject || "") + "</span>").join("") +
-      (m.invalidated_count > (m.invalidated_by || []).length
-        ? '<span class="commit">and ' + (m.invalidated_count - m.invalidated_by.length) + " more</span>" : "") + "</div>"
+      (st.count > st.by.length ? '<span class="commit">and ' + (st.count - st.by.length) + " more</span>" : "") + "</div>"
     : "";
 
   const own = isInline(m);
@@ -1694,7 +1702,7 @@ function flightPane() {
 }
 function attentionPane() {
   const s = state.snap, r = s.repo, items = [];
-  const stale = state.maps.filter(m => m.status === "stale");
+  const stale = state.maps.filter(isStale);
   const answered = state.proposals.filter(p => p.status === "answered");
   if (stale.length) items.push(["bad", '<button type="button" data-goto="exhibits">' + stale.length + (stale.length === 1 ? " map is" : " maps are") + " stale</button>; the code moved under " + (stale.length === 1 ? "it" : "them") + "."]);
   if (answered.length) items.push(["warn", answered.length + (answered.length === 1 ? " answer is" : " answers are") + " waiting for a session to act on " + (answered.length === 1 ? "it" : "them") + "."]);
@@ -2014,7 +2022,7 @@ function renderChrome() {
   el("n-exhibits").textContent = exh ? String(exh) : "";
   const bits = [];
   if (state.snapAt) bits.push("synced " + rel(state.snapAt));
-  const stale = state.maps.filter(m => m.status === "stale").length;
+  const stale = state.maps.filter(isStale).length;
   if (stale) bits.push(stale + (stale === 1 ? " stale map" : " stale maps"));
   if (!state.canEdit && state.ready && state.db) bits.push("read only");
   el("stamp").textContent = bits.join(" · ") || (state.ready ? "nothing synced yet" : "connecting");

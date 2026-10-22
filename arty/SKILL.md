@@ -106,12 +106,13 @@ value in the database, never a branch in the page. `arty check` enforces this
 section.
 
 ```
-meta/project                   project, schema (3), remote, created, head
+meta/project                   project, schema, remote, created, head   (the seed; sync never writes it)
 
 snapshot/h-<id>                id, parts, bytes, generated_at, head, branch
 snapshot/p-<id>-NNN            id, n, data      a slice of the snapshot's JSON
                                written once by `arty sync`, never updated, never by hand
-                               the JSON carries `briefs` (section 4), `board` and `deviations`
+                               the JSON carries `briefs` (section 4), `board`, `deviations`,
+                               and `maps` -- each live map's staleness, {stale, count, by[], commit}
 
 proposals/p-YYYYMMDD-HHMM-slug
   title          one line, the call to be made
@@ -137,9 +138,8 @@ maps/m-slug
   anchors[]      pathspecs the map describes       (required)
   commit         HEAD when it was last refreshed
   refreshed_at
-  status         current | stale | retired
+  status         current | retired   (whether it is stale is derived: the snapshot's `maps`)
   claims         {verified, unverified, partial, planned}   rollup, derived
-  invalidated_by[{commit, subject}], invalidated_count, checked_at   by sync
 
 reports/r-YYYYMMDD-slug
   title, question, answer, date, anchors[]
@@ -157,8 +157,11 @@ advance, so refreshing the snapshot never depends on versions from a read. Its b
 `TODO.md` and `INDEX.md` — are constants at the top of `arty`.
 
 Schema 1 had a `records` collection projected from the ADRs and changelogs, and
-schema 2 a `briefings` collection an agent wrote. The snapshot replaces both: the
-first sync at schema 3 deletes those rows.
+schema 2 a `briefings` collection an agent wrote. The snapshot replaces both: a sync
+given a dump of those collections deletes them. Schema 3's sync wrote `status: stale`
+and `invalidated_by` into map rows. Schema 4 computes staleness into the snapshot
+instead, so sync writes nothing an agent or the page owns. The page ignores the old
+fields once a schema-4 snapshot has a map's state.
 
 Rows are never deleted or moved to archive them: `status` flips, and the queries
 below are what keep retired rows out of context.
@@ -248,35 +251,43 @@ question stopped mattering. Never silently delete a proposal the user answered.
 
 Refresh the console **at the end of any session that committed or changed
 `docs/`**, and whenever arty is used. The Stop hook (section 7) holds a session
-that forgets. The routine part needs no judgement — run it as written:
+that forgets. The refresh is a function: the same three reads, one command, and then
+its output passed on unchanged. No judgement and no editing in between:
 
 ```
-read_db  db_op=list  collection=<proposals|maps|reports>  out_dir=$DUMP
-read_db  db_op=get   collection=meta      doc_id=project  out_dir=$DUMP
-read_db  db_op=list  collection=snapshot                  out_dir=$DUMP
-read_db  db_op=list  collection=<records|briefings>       out_dir=$DUMP   # schema-1/2 consoles only
+read_db  db_op=query  collection=snapshot   query={"where":[["parts","gte",1]]}       out_dir=$DUMP
+read_db  db_op=query  collection=maps       query={"where":[["status","ne","retired"]]} out_dir=$DUMP
+read_db  db_op=query  collection=proposals  query={"where":[["status","eq","answered"]]} out_dir=$DUMP
 ```
 ```sh
-arty sync  --db "$DUMP" --plan "$PLAN"    # prints the plan, the deviations, then the batches
-arty check --db "$DUMP"
+arty sync --db "$DUMP" --plan "$PLAN"    # prints the plan, the deviations, then the batches
 ```
 ```
-write_db db_op=batch writes=<batch 1>      # then batch 2, ... in order
+write_db db_op=batch writes=<batch 1, exactly as printed>      # then batch 2, ... in order
 ```
 
-Batches respect write_db's limits (50 entries, 1 MiB) and their order matters:
-parts, then the head, then the old snapshot's deletes. An entry reading
-`"if_version": "<version from the read>"` takes the version the read reported for
-that row; the dumped files don't carry it.
+Send the three reads in one turn; they don't depend on each other. Keep `$DUMP` and
+`$PLAN` in the scratchpad, never inside the repository, because an untracked file
+there counts as a change and makes a new snapshot. A read that matches nothing writes
+no directory, and sync takes that as empty.
+
+**Why nothing needs pinning.** Sync writes only to `snapshot`. Its rows are named by a
+digest of their content and only ever created. An old snapshot's rows are deleted at
+version 1, the version every created row has, and the old head names its parts, so the
+heads are the only part of `snapshot` to read. Map staleness is computed from the
+`maps` read and carried in the snapshot. Sync never writes it back to the map rows. So
+every write sync plans is either a create or a delete pinned at 1. Batches respect
+write_db's limits (50 entries, 1 MiB), and their order matters: parts, then the new
+head, then the old snapshot (its head before its parts).
 
 Sync builds the snapshot from git and the working tree's `docs/` (briefings
 included, and any directory `.arty` names — section 1), prints how many dated files
 it read from each record directory and which it passed over, splits the snapshot
-into parts, recomputes each map's staleness as `git log <commit>..HEAD -- <anchors>`
-(so the page can name the commits that may have invalidated it), and records in
-`.git/arty-synced` what it saw, which is what `arty due` compares against. It
-merges, never replaces: authored fields survive. The page reads the newest head
-whose parts have all arrived, so it never assembles half a snapshot.
+into parts, computes each live map's staleness as `git log <commit>..HEAD --
+<anchors>` (so the page can name the commits that may have invalidated it), and
+records in `.git/arty-synced` what it saw, which is what `arty due` compares against.
+The page reads the newest head whose parts have all arrived, so it never assembles
+half a snapshot.
 
 **Deviations** close sync's output. `deviations: none` means the refresh is done
 once the batches are written. Otherwise each line names what is off and the fix:
@@ -290,10 +301,15 @@ once the batches are written. Otherwise each line names what is off and the fix:
 | `docs` a TODO or INDEX link to a missing file | repoint it or drop the line (docky) |
 | `docs` more than 3 cards in Doing, or one 14+ days in Doing (or in its current stage) | move it back to Next, split it, or mark the blocker (docky) |
 
-`arty check` errors are deviations too. The page shows the `docs` ones under
-Attention, so they are visible remotely until fixed.
+The page shows the `docs` ones under Attention, so they are visible remotely until
+fixed.
 
-Dump only to sync. For everything else, query — `{"where":[["status","eq","open"]]}`
+**`arty check` is an audit, not part of the refresh.** It wants a whole dump
+(`read_db db_op=list` of `meta`, `snapshot`, `proposals`, `maps`, `reports`), and
+validates the rows agents wrote against section 3. Run it after writing proposals,
+maps or reports, or when the console looks wrong.
+
+Dump only to sync or audit. For everything else, query — `{"where":[["status","eq","open"]]}`
 for the inbox, `[["status","ne","retired"]]` for the live maps. Never read an
 exhibit's body unless the task is about that exhibit.
 
@@ -411,8 +427,8 @@ source is `console.html` beside it.
 ```sh
 arty init      --url URL [--name NAME] [--seed PATH]   # .arty pointer + meta/project seed
 arty page      [--project NAME]                        # console HTML on stdout
-arty sync      --db DUMP --plan DIR [--force]          # snapshot + staleness -> batch plan
-arty check     --db DUMP                               # schema, ceilings, dangling anchors
+arty sync      --db DUMP --plan DIR [--force]          # snapshot (with board, map staleness) -> pin-free batches
+arty check     --db DUMP                               # audit a whole dump: schema, ceilings, dangling anchors
 arty brief     [-n N]                                  # the briefing(s) and board the console shows, in a terminal
 arty snapshot  --out FILE                              # the snapshot as one JSON file
 arty due       [--hook]                                # is the console behind? (Stop hook)

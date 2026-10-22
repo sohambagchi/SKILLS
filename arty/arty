@@ -5,9 +5,9 @@ Subcommands, no dependencies beyond the standard library:
 
   init      write the .arty pointer and the meta/project seed for a new console
   page      emit the console HTML on stdout, for the agent to publish
-  sync      reconcile a console database dump against the repository: build the
-            snapshot (git graph, features, the whole docky tree), recompute map
-            staleness, and write a batch plan of the rows that changed
+  sync      build the snapshot (git graph, features, the whole docky tree, the
+            board, each live map's staleness) and print pin-free batches that
+            replace the previous snapshot -- the agent passes them on unchanged
   snapshot  write the snapshot as one JSON file, for a local look at the page
   due       say whether the console is behind the repository (a Stop hook)
   check     validate a console database dump against the schema
@@ -33,14 +33,14 @@ import subprocess
 import sys
 import time
 
-SCHEMA = 3
+SCHEMA = 4
 POINTER = ".arty"
 HERE = os.path.dirname(os.path.realpath(__file__))
 PAGE = os.path.join(HERE, "console.html")
 
 KINDS = ("proposals", "maps", "reports")
 PROPOSAL_STATUS = ("open", "answered", "accepted", "withdrawn", "superseded")
-MAP_STATUS = ("current", "stale", "retired")
+MAP_STATUS = ("current", "retired", "stale")   # stale: written by schema-3 syncs; now derived
 REPORT_STATUS = ("current", "settled", "stale")
 CLAIM_STATUS = ("verified", "unverified", "partial", "planned")
 URGENCY = ("blocking", "soon", "whenever")
@@ -49,6 +49,7 @@ URGENCY = ("blocking", "soon", "whenever")
 MAX_OPEN_PROPOSALS = 6
 MAX_LIVE_MAPS = 12
 BLOCKING_AGE_DAYS = 7
+STALE_WARN_DAYS = 30          # a map stale this long is named as a warning, never archived
 CHANGELOG_BEHIND = 15         # commits on HEAD's line before the last changelog reads as old
 
 # Snapshot bounds. A part is one database document, which caps at 256 KiB
@@ -124,14 +125,17 @@ def read_pointer(root):
     return out
 
 
-def load_dump(path):
+def load_dump(path, missing_ok=False):
     """Load a read_db --out_dir tree: <dump>/<collection>/<doc_id>.json.
 
     Returns {collection: {doc_id: body}}. A `version` field in a body is kept
-    out of the row and handed back separately so writes can be pinned.
+    out of the row and handed back separately so writes can be pinned. A read
+    that matched nothing writes no directory, so `missing_ok` reads that as empty.
     """
     rows, versions = {}, {}
     if not os.path.isdir(path):
+        if missing_ok:
+            return rows, versions
         die("no such dump directory: %s (read_db with out_dir first)" % path)
     for dirpath, _dirnames, filenames in os.walk(path):
         rel = os.path.relpath(dirpath, path)
@@ -844,7 +848,10 @@ def doc_deviations(root, docs, board=None):
     return out
 
 
-def build_snapshot(root):
+def build_snapshot(root, maps=None):
+    """`maps` are the console's map rows, when the caller read them: their
+    staleness is computed here and carried in the snapshot, so a sync never
+    writes to a row an agent or the page owns."""
     pointer = read_pointer(root)
     default = default_branch()
     remote = git("remote", "get-url", "origin", check=False)
@@ -877,6 +884,7 @@ def build_snapshot(root):
         "board": board,
         "briefs": snap_briefs(docs, commits, features),
         "deviations": doc_deviations(root, docs, board),
+        "maps": {mid: st for mid, st in ((mid, map_staleness(row)[0]) for mid, row in sorted((maps or {}).items())) if st},
     }
     body = json.dumps(snap, sort_keys=True, separators=(",", ":"))
     snap["id"] = hashlib.sha1(body.encode()).hexdigest()[:16]
@@ -932,48 +940,42 @@ def synced_path():
 def map_staleness(row, limit=5):
     """Commit range: what has touched this map's anchors since it was refreshed.
 
-    Returns (patch, note). The commit range is the signal the user chose over a
-    content digest precisely because it can name the commits, so the page can
-    show which ones may have invalidated the map.
+    Returns (state, note); state is None when the map can't be checked. The
+    commit range is the signal the user chose over a content digest precisely
+    because it can name the commits, so the page can show which ones may have
+    invalidated the map. Nothing here depends on the clock: the state goes into
+    the snapshot, which must come out the same for the same repository.
     """
     anchors = [a for a in row.get("anchors", []) if isinstance(a, str) and a]
     commit = row.get("commit")
     if row.get("status") == "retired":
-        return {}, "retired"
+        return None, "retired"
     if not anchors:
-        return {}, "no anchors - cannot check"
+        return None, "no anchors - cannot check"
     if not commit:
-        return {}, "no commit - register a refresh first"
+        return None, "no commit - register a refresh first"
     if git("cat-file", "-t", commit, check=False) != "commit":
-        return {}, "commit %s is not in this repository" % commit[:9]
-    tracked = git("ls-files", "--", *anchors)
-    if not tracked:
-        return {}, "anchors match no tracked file"
+        return None, "commit %s is not in this repository" % commit[:9]
+    if not git("ls-files", "--", *anchors):
+        return None, "anchors match no tracked file"
     log = git("log", "--format=%h\t%s", "%s..HEAD" % commit, "--", *anchors)
     lines = [l for l in log.splitlines() if l.strip()]
-    patch = {"checked_at": now(), "checked_at_commit": git("rev-parse", "--short", "HEAD")}
+    state = {"stale": bool(lines), "count": len(lines), "commit": commit[:10],
+             "by": [{"commit": l.split("\t")[0], "subject": one_line(l.split("\t", 1)[1], 90)} for l in lines[:limit]]}
     if lines:
-        patch["status"] = "stale"
-        patch["invalidated_count"] = len(lines)
-        patch["invalidated_by"] = [
-            {"commit": l.split("\t")[0], "subject": one_line(l.split("\t", 1)[1], 90)}
-            for l in lines[:limit]
-        ]
-        return patch, "stale: %d commit%s since %s" % (
-            len(lines), "" if len(lines) == 1 else "s", commit[:9])
-    patch["status"] = "current"
-    patch["invalidated_count"] = 0
-    patch["invalidated_by"] = []
-    return patch, "current"
+        return state, "stale: %d commit%s since %s" % (len(lines), "" if len(lines) == 1 else "s", commit[:9])
+    return state, "current"
 
 
-def changed(old, new):
-    """Fields of `new` that `old` does not already carry, compared as JSON."""
-    out = {}
-    for k, v in new.items():
-        if json.dumps(old.get(k), sort_keys=True) != json.dumps(v, sort_keys=True):
-            out[k] = v
-    return out
+def stale_since(row):
+    """Epoch of the oldest commit that touched the map's anchors since its refresh, or None."""
+    anchors = [a for a in row.get("anchors", []) if isinstance(a, str) and a]
+    commit = row.get("commit")
+    if not anchors or not commit or git("cat-file", "-t", commit, check=False) != "commit":
+        return None
+    log = git("log", "--reverse", "--format=%ct", "%s..HEAD" % commit, "--", *anchors, check=False)
+    first = log.split()[:1]
+    return int(first[0]) if first else None
 
 
 # ----------------------------------------------------------------- subcommands
@@ -1031,12 +1033,19 @@ def cmd_snapshot(args):
 
 
 def cmd_sync(args):
+    """The routine refresh, as a function of the repository and three reads.
+
+    Every write it plans is pin-free: snapshot rows are named by their content's
+    digest and only ever created, and an old snapshot's rows are deleted at
+    version 1, the version every created row has. So the batches it prints go
+    to write_db as they are -- nothing to look up, nothing to merge.
+    """
     root = repo_root()
     os.chdir(root)
-    rows, versions = load_dump(args.db)
+    rows, versions = load_dump(args.db, missing_ok=True)
     plan, notes, quiet = [], [], 0
 
-    def entry(op, collection, doc, body, note):
+    def entry(op, collection, doc, body, note, pin=None):
         item = {"op": op, "collection": collection, "doc_id": doc}
         if body is not None:
             path = os.path.join(args.plan, collection)
@@ -1046,26 +1055,27 @@ def cmd_sync(args):
                 json.dump(body, fh, sort_keys=True)
                 fh.write("\n")
             item["file_path"] = path
-        ver = versions.get(collection, {}).get(doc)
-        if op in ("update", "delete"):
-            item["if_version"] = ver or "<version from the read>"
+        if pin is not None:
+            item["if_version"] = pin
         plan.append(item)
         notes.append("  %-6s %s/%s  (%s)" % (op, collection, doc, note))
 
-    meta = rows.get("meta", {}).get("project")
-    if meta and meta.get("schema") != SCHEMA:
-        entry("update", "meta", "project", {"schema": SCHEMA}, "schema %s -> %d" % (meta.get("schema"), SCHEMA))
+    # Schemas 1 and 2 kept derived rows the snapshot replaced. They show up only
+    # when a console that old is dumped whole, and the read carries their versions.
+    for legacy, why in (("records", "schema 2 drops records"), ("briefings", "schema 3 reads the briefing from the changelogs")):
+        for rid in sorted(rows.get(legacy, {})):
+            entry("delete", legacy, rid, None, why, versions.get(legacy, {}).get(rid) or "<version from the read>")
 
-    # Schema 1 projected ADRs and changelogs into `records`; the snapshot now
-    # carries the whole docs tree, so those rows are derived copies to drop.
-    for rid in sorted(rows.get("records", {})):
-        entry("delete", "records", rid, None, "schema 2 drops records")
-    # Schema 2 had agent-written briefings; schema 3 reads them from docky's changelogs.
-    for bid in sorted(rows.get("briefings", {})):
-        entry("delete", "briefings", bid, None, "schema 3 reads the briefing from the changelogs")
-
-    snap = build_snapshot(root)
+    maps = rows.get("maps", {})
+    snap = build_snapshot(root, maps)
     have = rows.get("snapshot", {})
+    old = set()
+    for doc, row in have.items():   # heads name their parts, so a read of the heads alone is enough
+        if doc.startswith("h-"):
+            old.add(doc)
+            old.update("p-%s-%03d" % (row.get("id") or doc[2:], n) for n in range(int(row.get("parts") or 0)))
+        else:
+            old.add(doc)
     if "h-" + snap["id"] in have and not args.force:
         quiet += 1
         notes.append("  %-6s snapshot  (%s unchanged)" % ("skip", snap["id"]))
@@ -1074,22 +1084,16 @@ def cmd_sync(args):
         for doc, body in srows:
             entry("set", "snapshot", doc, body, "%d bytes" % len(json.dumps(body)) if doc.startswith("p-") else "head of %s" % snap["id"])
         new = set(doc for doc, _ in srows)
-        for doc in sorted(have):  # the previous snapshot, written once, so at version 1
-            if doc not in new:
-                versions.setdefault("snapshot", {})[doc] = versions.get("snapshot", {}).get(doc) or 1
-                entry("delete", "snapshot", doc, None, "previous snapshot")
+        # Heads first, so no head is left pointing at deleted parts.
+        for doc in sorted(old - new, key=lambda d: (not d.startswith("h-"), d)):
+            entry("delete", "snapshot", doc, None, "previous snapshot", pin=1)
 
     deviations = [("docs", d["msg"], d["fix"]) for d in snap["deviations"]]
-    for mid, row in sorted(rows.get("maps", {}).items()):
-        patch, note = map_staleness(row)
-        delta = changed(row, patch) if patch else {}
-        if delta:
-            entry("update", "maps", mid, delta, note)
-        else:
-            quiet += 1
-            if not patch:
-                notes.append("  %-6s maps/%s  (%s)" % ("skip", mid, note))
-        if (patch or row).get("status") == "stale":
+    for mid, row in sorted(maps.items()):
+        st, note = map_staleness(row)
+        if st is None and row.get("status") != "retired":
+            notes.append("  %-6s maps/%s  (%s)" % ("skip", mid, note))
+        if st and st["stale"]:
             deviations.append(("stale", "maps/%s: %s" % (mid, note),
                                "refresh the exhibit and re-anchor it, or retire it (arty SKILL.md section 8)"))
     for pid, row in sorted(rows.get("proposals", {}).items()):
@@ -1182,8 +1186,8 @@ def cmd_due(args):
     if last == docs_digest(root):
         return
     reason = ("The project console (%s) is behind this repository. Routine refresh, no judgement "
-              "needed: dump the console, run `arty sync`, write the batches it prints in order "
-              "(arty SKILL.md section 6). Act only on the deviations sync lists."
+              "needed: the three reads, `arty sync`, then each batch it prints, passed to write_db "
+              "unchanged (arty SKILL.md section 6). Act only on the deviations sync lists."
               % read_pointer(root).get("console", ".arty"))
     docs = snap_docs(root)
     found = doc_deviations(root, docs, snap_board(docs, snap_versions()))
@@ -1287,8 +1291,6 @@ def cmd_check(args):
     meta = rows.get("meta", {}).get("project")
     if not meta:
         err("meta/project", "missing -- run arty init and seed it")
-    elif meta.get("schema") != SCHEMA:
-        err("meta/project", "schema %r, this arty speaks %d -- run a sync" % (meta.get("schema"), SCHEMA))
 
     for collection in rows:
         if collection not in KINDS and collection not in ("meta", "snapshot", "records", "briefings"):
@@ -1305,6 +1307,8 @@ def cmd_check(args):
         others = [d for d in snap if not d.endswith(head.get("id")) and not ("-%s-" % head.get("id")) in d]
         if others:
             warn("snapshot", "%d rows from older snapshots -- the next sync deletes them" % len(others))
+        if head.get("schema") != SCHEMA:
+            err("snapshot/h-%s" % head.get("id"), "schema %r, this arty speaks %d -- run a sync" % (head.get("schema"), SCHEMA))
         if head.get("head") and head["head"] != short(git("rev-parse", "HEAD", check=False)):
             warn("snapshot", "built at %s, HEAD is %s -- run a sync" % (head["head"], git("rev-parse", "--short", "HEAD")))
 
@@ -1359,6 +1363,7 @@ def cmd_check(args):
             if age > BLOCKING_AGE_DAYS:
                 warn(where, "blocking and %d days old" % age)
 
+    stale = []
     for doc, row in sorted(rows.get("maps", {}).items()):
         where = "maps/%s" % doc
         if row.get("status") not in MAP_STATUS:
@@ -1371,6 +1376,13 @@ def cmd_check(args):
         check_figures(where, row, err)
         if row.get("status") != "retired" and not row.get("anchors"):
             err(where, "no anchors -- nothing to go stale against")
+        st = map_staleness(row)[0]
+        if st and st["stale"]:
+            stale.append(doc)
+        since = stale_since(row) if st and st["stale"] else None
+        if since and (time.time() - since) / 86400 > STALE_WARN_DAYS:
+            warn(where, "stale for %d days -- refresh it or demote it to a dated report"
+                 % ((time.time() - since) / 86400))
         claims = row.get("claims") or {}
         for key in claims:
             if key not in CLAIM_STATUS:
@@ -1406,7 +1418,6 @@ def cmd_check(args):
     if waiting:
         print("pickup %d answered proposal%s: %s"
               % (len(waiting), "" if len(waiting) == 1 else "s", ", ".join(sorted(waiting))))
-    stale = [d for d, r in rows.get("maps", {}).items() if r.get("status") == "stale"]
     if stale:
         print("stale  %d map%s: %s" % (len(stale), "" if len(stale) == 1 else "s", ", ".join(sorted(stale))))
     for line in warnings:
