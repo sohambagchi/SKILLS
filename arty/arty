@@ -23,6 +23,8 @@ underspecified -- fix the schema, not this file.
 See SKILL.md for the schema itself; section references below point into it.
 """
 import argparse
+import datetime
+import difflib
 import hashlib
 import json
 import os
@@ -505,9 +507,27 @@ def snap_versions():
 # just changed and the TODO list as of that commit says what comes next. Each
 # older changelog is an older briefing, with the TODO list as it stood then.
 
-TODO_ITEM = re.compile(r"^\s{0,3}[-*]\s+\[([ xX])\]\s+(.*\S)")
+TODO_ITEM = re.compile(r"^\s?[-*]\s+\[([ xX])\]\s+(.*\S)")       # a task; indented ones are its subtasks
+SUBTASK = re.compile(r"^\s{2,}[-*]\s+\[([ xX])\]\s+(.*\S)")
+MARKER = re.compile(r"\s+(?:—|–|--?)\s*(blocked(?:\s+on)?|details|stages)\s*:\s*((?:(?!\s+(?:—|–|--?)\s*(?:blocked|details|stages)\b).)+)$", re.I)
 BLOCKED = re.compile(r"\s+(?:—|–|--?)\s*blocked(?:\s+on)?\s*:\s*(.+)$", re.I)
+TAGS = re.compile(r"(?:\s+[#+][a-z][a-z0-9-]*)+$", re.I)
 MD_LINK = re.compile(r"\]\(([^)\s]+)\)")
+
+# docky's board: a TODO.md whose `##` headings are all column names. Left to
+# right on the page; docky writes them top-down Doing, Review, Next, Backlog.
+# A card is one line:
+#   - [ ] [Category: ]<task> [#tag ...] [+epic] [— stages: a, [b], c] [— details: <link>] [— blocked: <on what>]
+#     - [ ] <subtask>
+BOARD = ("Backlog", "Next", "Doing", "Review")
+CATEGORIES = ("Feature", "Fix", "Investigate", "Evaluate", "Benchmark", "Refactor", "Deprecate")
+CATEGORY = re.compile(r"^(%s)\s*:\s+" % "|".join(CATEGORIES), re.I)
+LONG_STAGES = ("rebuild", "measure")   # .arty `long_stages = ...` names a project's own
+BOARD_WIP = 3                # cards in Doing before it reads as overloaded
+BOARD_STUCK_DAYS = 14        # days a Doing card can sit in one stage (or, staged or not, the column)
+BOARD_CLOSED_DAYS = 14       # how far back the Closed column reaches
+BOARD_CLOSED_MAX = 12
+BOARD_MATCH = 0.8            # similarity at which an edited card is the same card
 
 
 def git_show(rev, path):
@@ -516,25 +536,226 @@ def git_show(rev, path):
 
 
 def todo_items(text):
-    """docky's TODO.md: open items in order with their section, and how many are ticked."""
-    items, ticked, section = [], 0, ""
+    """docky's TODO.md: open items in order with their section and subtasks, and
+    how many top-level items are ticked (a ticked subtask is progress, not litter)."""
+    items, ticked, section, last = [], 0, "", None
     for line in (text or "").splitlines():
         h = re.match(r"^#{2,4}\s+(.*)", line)
         if h:
-            section = h.group(1).strip()
+            section, last = h.group(1).strip(), None
+            continue
+        sub = SUBTASK.match(line)
+        if sub:
+            if last is not None:
+                last.setdefault("subtasks", []).append({"text": sub.group(2), "done": sub.group(1) != " "})
             continue
         m = TODO_ITEM.match(line)
         if not m:
             continue
         if m.group(1) != " ":
             ticked += 1
+            last = None
             continue
-        item = {"text": m.group(2), "section": section}
-        b = BLOCKED.search(m.group(2))
+        item = {"text": m.group(2), "section": section, "raw": m.group(2)}
+        b = BLOCKED.search(item["text"])
         if b:
-            item["text"], item["blocked"] = m.group(2)[:b.start()], b.group(1).strip()
+            item["text"], item["blocked"] = item["text"][:b.start()], b.group(1).strip()
         items.append(item)
+        last = item
     return items, ticked
+
+
+def todo_columns(text):
+    """The board's columns in file order when TODO.md is one, else None."""
+    heads = [h.strip().lower() for h in re.findall(r"^##\s+(.*?)\s*#*\s*$", text or "", re.M)]
+    names = {c.lower(): c for c in BOARD}
+    return [names[h] for h in heads] if heads and all(h in names for h in heads) else None
+
+
+def parse_stages(raw):
+    """`dev, [rebuild], test` -> stages with their state; the bracketed one is under way."""
+    names = [x.strip() for x in raw.split(",") if x.strip()]
+    cur = next((i for i, n in enumerate(names) if n.startswith("[") and n.endswith("]")), None)
+    return [{"name": n.strip("[]").strip().lower(),
+             "state": "todo" if cur is None or i > cur else "now" if i == cur else "done"}
+            for i, n in enumerate(names)]
+
+
+def board_cards(text):
+    """A board's cards in order, each parsed into the fields docky's card line carries."""
+    if todo_columns(text) is None:
+        return None
+    names = {c.lower(): c for c in BOARD}
+    cards = []
+    for it in todo_items(text)[0]:
+        column = names.get(it["section"].lower())
+        if not column:
+            continue
+        rest, card = it["raw"], {"column": column}
+        while True:                      # the markers, in whatever order they were written
+            m = MARKER.search(rest)
+            if not m:
+                break
+            key = m.group(1).lower().split()[0]
+            if key == "stages":
+                card["stages"] = parse_stages(m.group(2))
+            else:
+                card[key] = m.group(2).strip()
+            rest = rest[:m.start()]
+        t = TAGS.search(rest)
+        words = t.group(0).split() if t else []
+        card["tags"] = [w[1:].lower() for w in words if w[0] == "#"]
+        epics = [w[1:].lower() for w in words if w[0] == "+"]
+        if epics:
+            card["epic"] = epics[0]
+        rest = rest[:t.start()] if t else rest
+        c = CATEGORY.match(rest)
+        if c:
+            card["category"] = next(x for x in CATEGORIES if x.lower() == c.group(1).lower())
+            rest = rest[c.end():]
+        card["text"] = rest
+        if it.get("subtasks"):
+            card["subtasks"] = it["subtasks"]
+        cards.append(card)
+    # A blocker that names another card points at it.
+    for c in cards:
+        if c.get("blocked"):
+            key = " ".join(c["blocked"].lower().split())
+            hit = [i for i, o in enumerate(cards) if o is not c and len(key) >= 8 and same_card(key, card_key(o)[:len(key)]) >= BOARD_MATCH]
+            if hit:
+                c["blocked_card"] = hit[0]
+    return cards
+
+
+def card_key(card):
+    return " ".join(card["text"].lower().split())
+
+
+def current_stage(card):
+    return next((s["name"] for s in card.get("stages", []) if s["state"] == "now"), None)
+
+
+def same_card(a, b):
+    """How alike two card texts are; a card whose text only grew is the same card."""
+    short_, long_ = sorted((a, b), key=len)
+    if len(short_) >= 12 and long_.startswith(short_):
+        return 1.0
+    return difflib.SequenceMatcher(None, a, b).ratio()
+
+
+def match_cards(now, then):
+    """Pair each card in `now` with its card in `then`: same text first, then the
+    closest edit. Returns {index in now: index in then}."""
+    pairs, free = {}, {}
+    for j, c in enumerate(then):
+        free.setdefault(card_key(c), []).append(j)
+    for i, c in enumerate(now):
+        js = free.get(card_key(c))
+        if js:
+            pairs[i] = js.pop(0)
+    left = [j for js in free.values() for j in js]
+    for i, c in enumerate(now):
+        if i in pairs or not left:
+            continue
+        score, j = max((same_card(card_key(c), card_key(then[j])), j) for j in left)
+        if score >= BOARD_MATCH:
+            pairs[i] = j
+            left.remove(j)
+    return pairs
+
+
+def epoch(iso):
+    return datetime.datetime.fromisoformat(iso.replace("Z", "+00:00")).timestamp()
+
+
+def walk_back(boards, cards, same, field):
+    """Set card[field] (and field_h) to the oldest version, walking back from the
+    newest, for which `same(card, older card)` held without a break."""
+    trail = {}
+    for i, c in enumerate(cards):
+        c[field], c[field + "_h"] = boards[0][0]["t"], boards[0][0]["h"]
+        trail[i] = i
+    for (v, older), (_newer, newer) in zip(boards[1:], boards):
+        pairs = match_cards(newer, older)
+        for i, j in list(trail.items()):
+            k = pairs.get(j)
+            if k is None or not same(cards[i], older[k]):
+                del trail[i]
+            else:
+                trail[i] = k
+                cards[i][field], cards[i][field + "_h"] = v["t"], v["h"]
+        if not trail:
+            break
+    return trail
+
+
+def snap_board(docs, versions):
+    """docky's board, when TODO.md is one: each card with the commit it entered
+    its column (and its current stage) at, and the cards that left the board
+    lately. Ages come from committed versions only, so an unchanged repository
+    yields the same board; the page counts the days itself."""
+    todo = next((d for d in docs if d["path"] == "docs/TODO.md"), None)
+    if not todo or todo_columns(todo["md"]) is None:
+        return None
+    committed = [v for v in versions.get("docs/TODO.md", []) if v.get("md") is not None]
+    vs = committed if committed and committed[0]["md"] == todo["md"] else [{"h": None, "t": None, "md": todo["md"]}] + committed
+    boards = []
+    for v in vs:
+        cards = board_cards(v["md"])
+        if cards is None:
+            break                 # older than the board: a flat list has no columns
+        boards.append((v, cards))
+    cards = boards[0][1]
+    trail = walk_back(boards, cards, lambda c, o: c["column"] == o["column"], "since")
+    if len(boards) == len(vs) and len(committed) >= SNAP_VERSIONS:
+        for i in trail:
+            cards[i]["since_floor"] = True   # there at least since the oldest version kept
+    staged = [c for c in cards if current_stage(c)]
+    if staged:
+        walk_back(boards, cards, lambda c, o: c["column"] == o["column"] and current_stage(c) == current_stage(o), "stage_since")
+    for c in cards:
+        if not current_stage(c):
+            c.pop("stage_since", None)
+            c.pop("stage_since_h", None)
+    # Closed: cards a version had that the next version no longer has.
+    head_t = git("log", "-1", "--format=%ct", check=False)
+    horizon = int(head_t) - BOARD_CLOSED_DAYS * 86400 if head_t.isdigit() else 0
+    logs = {d["added"]: d["path"] for d in docs if d["kind"] == "changelog" and d.get("added")}
+    dirty_log = next((d["path"] for d in docs if d["kind"] == "changelog" and d.get("dirty") and not d.get("added")), None)
+    closed = []
+    for (v, newer), (_older, older) in zip(boards, boards[1:]):
+        if v["t"] and epoch(v["t"]) < horizon:
+            break
+        kept = set(match_cards(newer, older).values())
+        closed += [{k: c[k] for k in ("text", "tags", "epic", "category") if k in c} |
+                   {"from": c["column"], "at": v["h"], "t": v["t"], "changelog": logs.get(v["h"]) if v["h"] else dirty_log}
+                   for j, c in enumerate(older) if j not in kept]
+    pointer = read_pointer(git("rev-parse", "--show-toplevel", check=False) or ".")
+    long_ = [x.strip().lower() for x in pointer.get("long_stages", "").split(",") if x.strip()] or list(LONG_STAGES)
+    return {"columns": list(BOARD), "cards": cards, "closed": closed[:BOARD_CLOSED_MAX], "wip": BOARD_WIP,
+            "stuck_days": BOARD_STUCK_DAYS, "long_stages": long_, "categories": list(CATEGORIES)}
+
+
+def board_deviations(board):
+    if not board:
+        return []
+    out = []
+    doing = [c for c in board["cards"] if c["column"] == "Doing"]
+    if len(doing) > BOARD_WIP:
+        out.append({"kind": "board", "msg": "%d cards in Doing, over the limit of %d" % (len(doing), BOARD_WIP),
+                    "fix": "move the ones not being worked on back to Next (docky)"})
+    head_t = git("log", "-1", "--format=%ct", check=False)
+    for c in doing:
+        stage = current_stage(c)
+        since = c.get("stage_since") if stage else c.get("since")
+        if not since or not head_t.isdigit():
+            continue
+        days = (int(head_t) - epoch(since)) / 86400
+        if days > BOARD_STUCK_DAYS:
+            where = "at its %s stage" % stage if stage else "in Doing"
+            out.append({"kind": "board", "msg": "%r has been %s for %d days" % (one_line(c["text"], 60), where, days),
+                        "fix": "split it, mark what blocks it, or move it back to Next (docky)"})
+    return out
 
 
 def body_after_title(md):
@@ -577,8 +798,11 @@ def snap_briefs(docs, commits, features):
         b["v"] = c["v"] if c else None
         if todos[i] is None:
             continue
-        items, _ticked = todo_items(todos[i])
+        items = [{k: v for k, v in it.items() if k != "raw"} for it in todo_items(todos[i])[0]]
         open_ = [it for it in items if "blocked" not in it]
+        if todo_columns(todos[i]):    # a board: what comes next is Doing, then Next
+            rank = {"doing": 0, "next": 1}
+            open_ = sorted((it for it in open_ if it["section"].lower() in rank), key=lambda it: rank[it["section"].lower()])
         b["next"], b["next_total"] = open_[:BRIEF_NEXT], len(open_)
         b["blocked"] = [it for it in items if "blocked" in it]
         if i + 1 < len(out) and todos[i + 1] is not None:
@@ -589,9 +813,9 @@ def snap_briefs(docs, commits, features):
     return out
 
 
-def doc_deviations(root, docs):
+def doc_deviations(root, docs, board=None):
     """What only a session's judgement can fix in docs/, found without one."""
-    out = []
+    out = board_deviations(board)
     logs = sorted((d for d in docs if d["kind"] == "changelog" and d.get("added")),
                   key=lambda d: (d.get("date", ""), d.get("time", "")), reverse=True)
     if logs and not any(d["kind"] == "changelog" and not d.get("added") for d in docs):
@@ -633,6 +857,8 @@ def build_snapshot(root):
     commits = snap_commits(SNAP_COMMITS, doc_roots(dirs))
     features = snap_features(commits, refs, default)
     docs = snap_docs(root, dirs)
+    versions = snap_versions()
+    board = snap_board(docs, versions)
     snap = {
         "v": 1,
         "project": pointer.get("project") or os.path.basename(root),
@@ -647,9 +873,10 @@ def build_snapshot(root):
         "commits": commits,
         "features": features,
         "docs": docs,
-        "versions": snap_versions(),
+        "versions": versions,
+        "board": board,
         "briefs": snap_briefs(docs, commits, features),
-        "deviations": doc_deviations(root, docs),
+        "deviations": doc_deviations(root, docs, board),
     }
     body = json.dumps(snap, sort_keys=True, separators=(",", ":"))
     snap["id"] = hashlib.sha1(body.encode()).hexdigest()[:16]
@@ -758,15 +985,15 @@ def cmd_init(args):
         die("not an artifact url: %s" % args.url)
     name = args.name or os.path.basename(root)
     pointer = os.path.join(root, POINTER)
-    keep = read_pointer(root)  # a re-init must not drop the docs paths
+    keep = read_pointer(root)  # a re-init must not drop the project's own settings
     with open(pointer, "w") as fh:
         fh.write("# The project console. Live state lives there, not here.\n")
         fh.write("console = %s\n" % args.url)
         fh.write("project = %s\n" % name)
         fh.write("schema = %d\n" % SCHEMA)
-        for kind in DOCS_DIRS:
-            if keep.get(kind + "_dir"):
-                fh.write("%s_dir = %s\n" % (kind, keep[kind + "_dir"]))
+        for key in [k + "_dir" for k in DOCS_DIRS] + ["long_stages"]:
+            if keep.get(key):
+                fh.write("%s = %s\n" % (key, keep[key]))
     remote = git("remote", "get-url", "origin", check=False)
     seed = {
         "project": name,
@@ -958,7 +1185,8 @@ def cmd_due(args):
               "needed: dump the console, run `arty sync`, write the batches it prints in order "
               "(arty SKILL.md section 6). Act only on the deviations sync lists."
               % read_pointer(root).get("console", ".arty"))
-    found = doc_deviations(root, snap_docs(root))
+    docs = snap_docs(root)
+    found = doc_deviations(root, docs, snap_board(docs, snap_versions()))
     if found:
         reason += " Already visible in docs/: " + "; ".join("%s (%s)" % (d["msg"], d["fix"]) for d in found) + "."
     if args.hook:
@@ -966,6 +1194,27 @@ def cmd_due(args):
     else:
         print(reason)
         sys.exit(1)
+
+
+def print_board(board):
+    """The board in a terminal: one block per column, Doing first."""
+    for col in ("Doing", "Review", "Next", "Backlog"):
+        cards = [c for c in board["cards"] if c["column"] == col]
+        if not cards:
+            continue
+        print("%s (%d%s)" % (col.lower(), len(cards), "/%d" % board["wip"] if col == "Doing" else ""))
+        for c in cards[:BRIEF_NEXT if col == "Backlog" else len(cards)]:
+            label = "".join(" #" + t for t in c["tags"]) + (" +" + c["epic"] if c.get("epic") else "")
+            stages = " [%s]" % " > ".join(("*" if x["state"] == "now" else "") + x["name"] + ("✓" if x["state"] == "done" else "")
+                                          for x in c["stages"]) if c.get("stages") else ""
+            subs = c.get("subtasks", [])
+            print("  %s%s%s%s%s%s" % (c["category"] + ": " if c.get("category") else "", c["text"], label, stages,
+                                    " (%d/%d)" % (sum(x["done"] for x in subs), len(subs)) if subs else "",
+                                    " -- blocked on " + c["blocked"] if c.get("blocked") else ""))
+        if col == "Backlog" and len(cards) > BRIEF_NEXT:
+            print("  ... %d more" % (len(cards) - BRIEF_NEXT))
+    if board["closed"]:
+        print("closed (%d in the last %d days)" % (len(board["closed"]), BOARD_CLOSED_DAYS))
 
 
 def cmd_brief(args):
@@ -996,7 +1245,11 @@ def cmd_brief(args):
             print("blocked  %s -- on %s" % (it["text"], it["blocked"]))
         for t in b.get("closed", []):
             print("closed   %s" % t)
-    found = doc_deviations(root, docs)
+    board = snap_board(docs, snap_versions())
+    if board:
+        print()
+        print_board(board)
+    found = doc_deviations(root, docs, board)
     if found:
         print()
         print_deviations([("docs", d["msg"], d["fix"]) for d in found])
