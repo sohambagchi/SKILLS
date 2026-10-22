@@ -78,6 +78,66 @@ One file per coherent change set (feature, fix, refactor, session of work). Say 
 - Only create a `docs/todo/<timestamp>-<slug>.md` file if the task can't be captured in a few lines (multi-step plan, specs, repro steps). Default to no detail file.
 - Delete a detail file when its task is done. Move any decision it contains into an ADR first.
 
+### Board
+
+A `TODO.md` whose `##` headings are all column names is a kanban board, and the
+arty console draws it as one. Convert a flat list only when the user asks.
+
+```markdown
+# TODO
+
+## Doing
+- [ ] Fix: <task> #<area> — stages: edit, [test]
+
+## Review
+- [ ] <task> +<epic> — details: [<file>](todo/<file>)
+  - [x] <subtask>
+  - [ ] <subtask>
+
+## Next
+- [ ] Benchmark: <task> #<area> +<epic> — stages: dev, rebuild, measure — blocked: <other card's text>
+
+## Backlog
+- [ ] Investigate: <task>
+```
+
+| Column | A card goes here when |
+|---|---|
+| Doing | work on it has started. At most 3 cards. |
+| Review | it is built and waits on the user's check: a playthrough, a measurement, a read. |
+| Next | it is committed work. Top of the column = next to start. |
+| Backlog | it is an idea, a someday, or a gap nobody has committed to. |
+
+- Write the columns in that order. An empty column's heading may stay or go; any other `##` heading turns the board back into a list.
+- Move a card by moving its line — keep its text, so the console can tell how long it has sat in a column.
+- Starting work moves the card to Doing. Finishing it removes the card, closed as its category says (below); finishing work the user must check moves it to Review instead. Review cards leave when the user confirms.
+- A new task goes to Backlog unless the user committed to it, then Next.
+- Over 3 cards in Doing, or a card stuck 14+ days in Doing (in its current stage, when it has stages), is untidy: move it back to Next, split it, or mark what blocks it.
+
+**A card's line**, everything but the task optional:
+
+```
+- [ ] [Category: ]<task> [#area ...] [+epic] [— stages: ...] [— details: <link>] [— blocked: <on what>]
+```
+
+- **Category** — at most one, as the first word: `Feature`, `Fix`, `Investigate`, `Evaluate`, `Benchmark`, `Refactor`, `Deprecate`. Any other leading word is just text. Set it when the kind of work is clear. It decides how the card closes:
+
+  | Category | Closes with |
+  |---|---|
+  | Feature, Fix, Refactor | a changelog bullet |
+  | Investigate | the answer: an analysis report when it needs one (the card on the board counts as the user's ask), else a changelog bullet |
+  | Evaluate | an ADR recording the choice |
+  | Benchmark | the numbers: a report or arty map, linked from a changelog bullet |
+  | Deprecate | a changelog bullet for the removal; superseded docs move to `stale/` |
+
+- **Stages** — how big the card is, as the steps it must go through, in order: `— stages: dev, rebuild, test, measure`. Use the project's own words for steps that take a long time, so a long rebuild or measurement run can be seen before it starts: `edit` (a small change), `dev`, `rebuild`, `test`, `measure`, or whatever the project needs. Size a card by its stages, never in hours or days. While the card is in Doing, put the current stage in brackets, `dev, [rebuild], test`, and move the brackets as each stage finishes. A card with no brackets hasn't started. Steps that take a long time are named in `.arty` (`long_stages = rebuild, measure`) and drawn as such on the console.
+- **Area tags** — `#area`, lowercase, any number. They group by part of the project and replace topical sections.
+- **Epic** — `+epic`, one per card, for cards that each move through the columns on their own but belong to one larger piece of work. The console shows each epic's progress across the columns.
+- **Subtasks** — checkboxes indented under a card, for steps that never need their own column. They move with the card. Tick them as they finish (the one exception to "remove finished items"), and they leave with the card.
+- **Blocked on another card** — write the start of that card's text (`— blocked: Act-mood post-process`) and the console links the two.
+- Use a subtask when the step can't move by itself, and an epic when it can. Don't nest cards deeper than that.
+- Converting a flat list: committed items go to Next in their existing order, the rest to Backlog, and anything awaiting the user to Review. Sections become area tags, and a leading verb that is a category becomes one.
+
 ## Analysis artifacts — `docs/analysis-artifacts/`
 
 Markdown reports for complex analyses **the user asked for**: an investigation of some specific behavior, or a study of a region of the code.
